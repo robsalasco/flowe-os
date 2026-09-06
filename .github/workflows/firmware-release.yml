@@ -63,13 +63,29 @@ jobs:
           echo "RELEASE_TAG=${RELEASE_TAG}" >> "$GITHUB_ENV"
           echo "PRERELEASE=${PRERELEASE}" >> "$GITHUB_ENV"
 
+      - name: Stop when the release was built on the Mini
+        # Since 0.7 the tested firmware needs a library package that only
+        # the Mac Mini holds (tools/release/firmware-assets.sh in the
+        # monorepo). That path creates the release WITH its files, and the
+        # tag push lands here afterwards. If update.bin is already attached,
+        # this workflow has nothing to add and must not replace those bytes.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name' 2>/dev/null | grep -qx 'update.bin'; then
+            echo "release ${RELEASE_TAG} already carries update.bin (built on the Mini); skipping the CI build"
+            echo "SKIP_BUILD=true" >> "$GITHUB_ENV"
+          fi
+
       - name: Build firmware
+        if: env.SKIP_BUILD != 'true'
         # One env: x3 and x4 are aliases of the same universal image (the
         # firmware picks the panel at boot), so building both doubled CI time
         # to produce identical behavior.
         run: cd xphone-os && pio run -e x3
 
       - name: Build merged full-flash image
+        if: env.SKIP_BUILD != 'true'
         run: |
           # The web flasher's "clean install" path writes one image at offset
           # 0x0 (bootloader + partition table + app). The primary browser path
@@ -86,6 +102,7 @@ jobs:
             0x10000 "$BUILD/firmware.bin"
 
       - name: Stage release assets
+        if: env.SKIP_BUILD != 'true'
         run: |
           # Asset diet (2026-08-25): the image is universal, so the old
           # per-device names (flowe-x3/x4 .bin/.zip, versioned bins) were
@@ -166,6 +183,7 @@ jobs:
           PY
 
       - name: Create GitHub release
+        if: env.SKIP_BUILD != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
