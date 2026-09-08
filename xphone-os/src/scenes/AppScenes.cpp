@@ -1,8 +1,13 @@
 #include "AppScenes.h"
 
+#include <cstring>
+
 #include "AboutScene.h"
+#include "AppScene.h"
 #include "BlockScene.h"
 #include "FileTransferScene.h"
+#include "HomeScene.h"
+#include "WifiScene.h"
 #include "LauncherScene.h"
 #include "NotificationsScene.h"
 #include "PrioritiesScene.h"
@@ -32,6 +37,9 @@ TodayScene gToday;
 WorkoutScene gWorkout;
 ReaderScene gReader;
 FileTransferScene gFileTransfer;
+WifiScene gWifi;
+AppScene gApp;
+HomeScene gHome;
 }  // namespace
 
 void showLauncher() {
@@ -90,6 +98,11 @@ void showFileTransfer() {
   SCENES.switchTo(gFileTransfer);
 }
 
+void showWifi() {
+  gCurrentSceneId = SceneId::Wifi;
+  SCENES.switchTo(gWifi);
+}
+
 void showFileTransferAutoStart() {
   gCurrentSceneId = SceneId::FileTransfer;
   SCENES.switchTo(gFileTransfer);  // onEnter resets to Idle
@@ -106,8 +119,23 @@ void showFileTransferAutoStartDirect() {
   gFileTransfer.autoStartDirect();
 }
 
+void showFileTransferAutoStartInPlace(const bool direct) {
+  const SceneId from = gCurrentSceneId;
+  if (G_GFX) SCENES.composeActive(*G_GFX);  // the framebuffer = what is on glass, before the reader lets go
+  gCurrentSceneId = SceneId::FileTransfer;
+  SCENES.switchTo(gFileTransfer);  // the reader's onExit frees the book; the picture stays
+  gFileTransfer.beginSilent(static_cast<uint32_t>(from));
+  if (direct) gFileTransfer.autoStartDirect();
+  else gFileTransfer.autoStart();
+}
+
+void showSceneByIdQuiet(const SceneId id) {
+  if (id == SceneId::Reader) gReader.resumeQuietly();
+  showSceneById(id);
+}
+
 void stopFileTransferIfActive() {
-  if (SCENES.active() == &gFileTransfer) gFileTransfer.stopAndRestart();
+  if (SCENES.active() == &gFileTransfer) gFileTransfer.stopSession();
 }
 
 // boot() restore dispatch. Each show*() re-runs the scene's onEnter, which
@@ -118,12 +146,14 @@ void showSceneById(SceneId id) {
   switch (id) {
     case SceneId::Notifications: showNotifications(); break;
     case SceneId::Settings:      showSettings();      break;
+    case SceneId::Wifi:          showWifi();          break;
     case SceneId::Block:         showBlock();         break;
     case SceneId::Priorities:    showPriorities();    break;
     case SceneId::Today:         showToday();         break;
     case SceneId::About:         showAbout();         break;
     case SceneId::Reader:        showReader();        break;
     case SceneId::Workout:       showWorkout();       break;
+    case SceneId::Home:          showHome();          break;
     // FileTransfer deliberately NOT restored: waking straight into a scene
     // that would show a stale Idle menu (the radio never survives sleep)
     // helps nobody — fall through to the launcher.
@@ -143,6 +173,7 @@ const char* sceneName(SceneId id) {
     case SceneId::About:         return "About";
     case SceneId::Reader:        return "Reader";
     case SceneId::Workout:       return "Workout";
+    case SceneId::Home:          return "Home";
     case SceneId::FileTransfer:  return "Transfer";
     case SceneId::Launcher:      return "Launcher";
     default:                     return "Launcher";
@@ -173,7 +204,57 @@ void markWorkoutDirtyIfActive() {
   if (SCENES.active() == &gWorkout) gWorkout.markDirty();
 }
 
+void showHome() {
+  gCurrentSceneId = SceneId::Home;
+  SCENES.switchTo(gHome);
+}
+
+void homeDebugDump() { gHome.debugDump(); }
+bool homeRenderDormant(Gfx& gfx) { return gHome.renderDormant(gfx); }
+
+// Phase 3 (home.layout card): the phone changed the layout, tiles, or
+// widget order. Re-read the config; if the person is sitting on a root
+// scene, move them to the (possibly new) root so the change shows now.
+void applyHomeConfigLive() {
+  gHome.loadConfig();
+  gLauncher.loadSlots();
+  Scene* active = SCENES.active();
+  const bool onRoot = active == &gHome || active == &gLauncher;
+  if (onRoot) {
+    if (homeLayout() == HomeLayout::Widget) {
+      showHome();
+      gHome.markDirty();
+    } else {
+      showLauncher();
+      gLauncher.markDirty();
+    }
+  }
+}
+
+void markHomeDirtyIfActive() {
+  if (SCENES.active() == &gHome) gHome.markDirty();
+}
+
+void appDataArrived(const char* name) {
+  if (SCENES.active() == &gApp && gApp.loaded() && !strcmp(gApp.appName(), name)) {
+    gApp.open(name);  // re-reads app.json + the fresh data.json
+    gApp.markDirty();
+  }
+}
+
+bool showApp(const char* name) {
+  if (!gApp.open(name)) return false;
+  // Not persisted for wake restore in Phase 1: SceneId has no App entry
+  // yet, so sleeping from an app wakes to the launcher. The restore story
+  // lands with the home-screen phase, when the app name gets persisted too.
+  gCurrentSceneId = SceneId::Launcher;
+  SCENES.switchTo(gApp);
+  return true;
+}
+
 int launcherSelection() { return gLauncher.selection(); }
 
 void readerWhere(char* out, size_t n) { gReader.debugWhere(out, n); }
 void readerShelfDump() { gReader.debugShelfDump(); }
+void readerLineCids() { gReader.debugLineCids(); }
+void readerAcceptGoto(const char* key, uint32_t cid) { gReader.acceptGoto(key, cid); }

@@ -47,6 +47,18 @@ class PanelDriver {
   // --- lifecycle ---
   virtual void begin(EpdBus& bus) = 0;
   virtual void deepSleep(EpdBus& bus) = 0;
+  // Efficiency test plan P2 (2026-09-02): when on, the driver powers the
+  // panel's booster/analog block DOWN after every fast refresh instead of
+  // leaving it running until the next scrub. Controller RAM (the previous
+  // frame) is retained, so differential refreshes still work; the next
+  // refresh powers the block back up (~50-100 ms). Default: no-op.
+  virtual void setIdlePowerOff(bool on) { (void)on; }
+  // Bench lever: the temperature byte written before a HALF refresh (SSD1677
+  // 0x1A), 0x7F = the board default. The waveform length follows it.
+  virtual void setHalfTemp(int8_t c) { (void)c; }
+  virtual int8_t halfTemp() const { return 0x7F; }
+  virtual void setFirstRefreshFull(bool on) { (void)on; }
+  virtual bool idlePowerOff() const { return false; }
 
   // --- core paint path (load RAM + refresh) ---
   virtual void display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) = 0;

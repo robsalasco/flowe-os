@@ -82,7 +82,14 @@ class Uc8253X3Driver : public PanelDriver {
   void requestResync(uint8_t settlePasses) override;
   void skipInitialResync() override;
 
+  void setIdlePowerOff(bool on) override { _idlePowerOff = on; }
+  bool idlePowerOff() const override { return _idlePowerOff; }
+
  private:
+  bool _idlePowerOff = false;
+  // True while the charge pump is off for IDLE power saving (RAM intact),
+  // as opposed to off from begin()/sleep where the image may be stale.
+  bool _idleOff = false;
   void initController(EpdBus& bus);
   void loadBank(EpdBus& bus, const Uc8253LutBank& bank);
   void loadBankCdi(EpdBus& bus, uint8_t cdi0, uint8_t cdi1, const Uc8253LutBank& bank);

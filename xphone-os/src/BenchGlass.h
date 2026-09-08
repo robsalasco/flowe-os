@@ -147,6 +147,12 @@ inline void dumpFrameBuffer(Gfx& gfx) {
   const uint16_t stride = d.getDisplayWidthBytes();
   const uint32_t bytes = static_cast<uint32_t>(stride) * nh;
 
+  // The dump is a ~70 KB burst over native USB-CDC. HWCDC drops bytes when
+  // the host does not drain its ring buffer within tx_timeout_ms (100 ms by
+  // default); a loaded bench host (Mini at load 40 during builds) misses
+  // that window and every grab arrives corrupt. Wait instead of dropping.
+  Serial.setTxTimeoutMs(5000);
+
   Serial.printf(
       "[xphone-os] fb begin dev=%s nw=%u nh=%u stride=%u bytes=%lu lw=%d lh=%d orient=%s "
       "enc=rle-b64 crc32=%08lx\n",
@@ -179,6 +185,8 @@ inline void dumpFrameBuffer(Gfx& gfx) {
   }
   out.finish();
   Serial.printf("[xphone-os] fb end lines=%lu\n", static_cast<unsigned long>(out.lines()));
+  Serial.flush();
+  Serial.setTxTimeoutMs(100);
 }
 
 // --- cal --------------------------------------------------------------------

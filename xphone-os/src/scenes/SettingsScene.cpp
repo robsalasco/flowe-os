@@ -1,5 +1,7 @@
 #include "SettingsScene.h"
 
+#include "../Sleep.h"
+
 #include <SDCardManager.h>
 
 #include "../DeviceKind.h"
@@ -13,6 +15,7 @@
 #include "../SdUpdate.h"
 #include "../art/LauncherIcons.h"
 #include "AppScenes.h"
+#include "HomeScene.h"
 
 // Visual constants — borrowed from CrossPoint's settings list so the two
 // firmwares feel related on the same glass:
@@ -35,8 +38,24 @@ constexpr int kHeaderH = 46;   // ~= CrossPoint headerHeight 45 (BaseTheme.h:128
 constexpr int kRowPad = 16;    // row height = lineHeight(bold) + kRowPad
 
 
-constexpr const char* kMenuLabels[5] = {"File Transfer", "SD Firmware Update", "Icon style", "Restart", "About"};
-constexpr int kMenuCount = 5;
+// 0.7 ships the tile grid (Andrew, 2026-09-06 14:27): kExploreHomeApps in
+// HomeScene.h hides the Home layout row and the Sleep screen row here.
+constexpr const char* kMenuLabelsShip[6] = {"Wi-Fi", "Sleep", "SD Firmware Update", "Icon style", "Restart", "About"};
+constexpr const char* kMenuLabelsExplore[7] = {"Wi-Fi", "Sleep", "Home layout", "SD Firmware Update",
+                                               "Icon style", "Restart", "About"};
+constexpr int kMenuCount = kExploreHomeApps ? 7 : 6;
+inline const char* menuLabel(const int i) { return kExploreHomeApps ? kMenuLabelsExplore[i] : kMenuLabelsShip[i]; }
+// What a menu index means: the Home layout row only exists when exploring.
+enum class MenuAction : uint8_t { Wifi, Sleep, HomeLayout, Picker, IconStyle, Restart, About };
+inline MenuAction menuAction(const int i) {
+  static constexpr MenuAction kShip[6] = {MenuAction::Wifi, MenuAction::Sleep, MenuAction::Picker,
+                                          MenuAction::IconStyle, MenuAction::Restart, MenuAction::About};
+  static constexpr MenuAction kExplore[7] = {MenuAction::Wifi,      MenuAction::Sleep,   MenuAction::HomeLayout,
+                                             MenuAction::Picker,    MenuAction::IconStyle, MenuAction::Restart,
+                                             MenuAction::About};
+  return kExploreHomeApps ? kExplore[i] : kShip[i];
+}
+constexpr int kSleepRows = kExploreHomeApps ? 3 : 2;
 
 // Fixed-buffer UTF-8-safe truncation with "..." (same helper pattern as
 // NotificationsScene.cpp truncateToWidth).
@@ -95,12 +114,20 @@ const char* const* SettingsScene::softKeys() const {
   static constexpr const char* kListKeys[4] = {"BACK", "OPEN", SoftKey::Up, SoftKey::Down};
   static constexpr const char* kConfirmKeys[4] = {"NO", "YES", nullptr, nullptr};
   static constexpr const char* kIconKeys[4] = {"BACK", nullptr, SoftKey::Left, SoftKey::Right};
+  // Sleep is a list like any other (Andrew, 2026-09-06, after two tries at
+  // a special key layout): arrows move between rows, OPEN shows that row's
+  // choices with the current one marked, SELECT picks one.
+  static constexpr const char* kSleepKeys[4] = {"BACK", "OPEN", SoftKey::Up, SoftKey::Down};
+  static constexpr const char* kSleepPickKeys[4] = {"BACK", "SELECT", SoftKey::Up, SoftKey::Down};
   if (_view == View::ConfirmFlash || _view == View::ConfirmRestart) return kConfirmKeys;
   if (_view == View::IconStyle) return kIconKeys;
+  if (_view == View::Sleep) return kSleepKeys;
+  if (_view == View::SleepPick) return kSleepPickKeys;
   return kListKeys;
 }
 
 void SettingsScene::enterIconStyle() {
+  IconStyle::rescan();  // pick up pack files synced since boot
   _view = View::IconStyle;
   _status = nullptr;
   markDirty();
@@ -195,21 +222,74 @@ void SettingsScene::handleInput(Input& in) {
       if (in.wasPressed(Btn::Up) || in.wasPressed(Btn::Left)) moveSel(_menuSel, kMenuCount, -1);
       if (in.wasPressed(Btn::Down) || in.wasPressed(Btn::Right)) moveSel(_menuSel, kMenuCount, +1);
       if (in.wasPressed(Btn::Confirm)) {
-        if (_menuSel == 0) {
-          showFileTransfer();  // R2: Wi-Fi book sync with the Flowe app
-          return;
-        } else if (_menuSel == 1) {
-          enterPicker();
-        } else if (_menuSel == 2) {
-          enterIconStyle();
-        } else if (_menuSel == 3) {
-          _view = View::ConfirmRestart;
-          markDirty();
-        } else {
-          showAbout();
+        switch (menuAction(_menuSel)) {
+          case MenuAction::Wifi:
+            showWifi();  // the device's Wi-Fi screen (E1); a sync itself starts from the phone
+            return;
+          case MenuAction::Sleep:
+            _view = View::Sleep;
+            _sleepSel = 0;
+            markDirty();
+            break;
+          case MenuAction::HomeLayout:
+            // Toggle the home layout in place; the row's value repaints. The
+            // new root takes effect on the next BACK / long-press BACK.
+            setHomeLayout(homeLayout() == HomeLayout::Widget ? HomeLayout::Tiles : HomeLayout::Widget);
+            markDirty();
+            break;
+          case MenuAction::Picker:
+            enterPicker();
+            break;
+          case MenuAction::IconStyle:
+            enterIconStyle();
+            break;
+          case MenuAction::Restart:
+            _view = View::ConfirmRestart;
+            markDirty();
+            break;
+          case MenuAction::About:
+            showAbout();
+            break;
         }
       }
       break;
+
+    case View::Sleep:
+      if (in.wasPressed(Btn::Back)) {
+        _view = View::Menu;
+        markDirty();
+        return;
+      }
+      if (in.wasPressed(Btn::Up) || in.wasPressed(Btn::Left)) moveSel(_sleepSel, kSleepRows, -1);
+      if (in.wasPressed(Btn::Down) || in.wasPressed(Btn::Right)) moveSel(_sleepSel, kSleepRows, +1);
+      if (in.wasPressed(Btn::Confirm)) {
+        if (_sleepSel < 2) enterSleepPick();
+        else {
+          Sleep::cycleFace(+1);  // exploration-only row: two faces, OPEN flips
+          markDirty();
+        }
+      }
+      break;
+
+    case View::SleepPick: {
+      const int n = _sleepSel == 0 ? Sleep::napChoiceCount() : Sleep::offChoiceCount();
+      if (in.wasPressed(Btn::Back)) {
+        _view = View::Sleep;
+        markDirty();
+        return;
+      }
+      if (in.wasPressed(Btn::Up) || in.wasPressed(Btn::Left)) moveSel(_sleepPickSel, n, -1);
+      if (in.wasPressed(Btn::Down) || in.wasPressed(Btn::Right)) moveSel(_sleepPickSel, n, +1);
+      if (in.wasPressed(Btn::Confirm)) {
+        if (_sleepSel == 0) Sleep::setNapAfterMin(Sleep::napChoiceAt(_sleepPickSel));
+        else Sleep::setOffAfterMin(Sleep::offChoiceAt(_sleepPickSel));
+        Serial.printf("[xphone-os] settings: %s %u min\n", _sleepSel == 0 ? "nap after" : "off after",
+                      static_cast<unsigned>(_sleepSel == 0 ? Sleep::napAfterMin() : Sleep::offAfterMin()));
+        _view = View::Sleep;
+        markDirty();
+      }
+      break;
+    }
 
     case View::IconStyle:
       if (in.wasPressed(Btn::Back)) {
@@ -290,8 +370,27 @@ void SettingsScene::renderMenu(Gfx& gfx) {
   const int rowH = gfx.lineHeight(kFontBold) + kRowPad;
   int y = kHeaderH + 8;
   for (int i = 0; i < kMenuCount; i++) {
-    const char* value = (i == 2) ? IconStyle::activeName() : nullptr;
-    drawRow(gfx, y, rowH, kMenuLabels[i], value, i == _menuSel);
+    char sleepValue[24];
+    const char* value = nullptr;
+    switch (menuAction(i)) {
+      case MenuAction::Sleep: {
+        char nap[12], off[12];
+        Sleep::formatMinutes(nap, sizeof(nap), Sleep::napAfterMin());
+        Sleep::formatMinutes(off, sizeof(off), Sleep::offAfterMin());
+        snprintf(sleepValue, sizeof(sleepValue), "%s / %s", nap, off);
+        value = sleepValue;
+        break;
+      }
+      case MenuAction::HomeLayout:
+        value = homeLayout() == HomeLayout::Widget ? "Widget" : "Tiles";
+        break;
+      case MenuAction::IconStyle:
+        value = IconStyle::activeName();
+        break;
+      default:
+        break;
+    }
+    drawRow(gfx, y, rowH, menuLabel(i), value, i == _menuSel);
     y += rowH;
   }
 
@@ -301,6 +400,75 @@ void SettingsScene::renderMenu(Gfx& gfx) {
   snprintf(footer, sizeof(footer), "xphone-os %s (%s)", XPHONE_VERSION, gDeviceIsX3 ? "x3" : "x4");
   const int footY = gfx.height() - Scene::SOFTKEY_BAR_H - gfx.lineHeight(kFontRegular) - 6;
   gfx.drawTextCentered(kFontRegular, gfx.width() / 2, footY, footer);
+}
+
+// Settings > Sleep: two rows, each a choice list. NEXT (or Left/Right) cycles
+// the selected row; Up/Down picks the row. Saved at once.
+void SettingsScene::renderSleep(Gfx& gfx) {
+  drawHeader(gfx, "Sleep", nullptr);
+  const int rowH = gfx.lineHeight(kFontBold) + kRowPad;
+  int y = kHeaderH + 8;
+  char v[16];
+  Sleep::formatMinutes(v, sizeof(v), Sleep::napAfterMin());
+  drawRow(gfx, y, rowH, "Nap after", v, _sleepSel == 0);
+  y += rowH;
+  Sleep::formatMinutes(v, sizeof(v), Sleep::offAfterMin());
+  drawRow(gfx, y, rowH, "Off after", v, _sleepSel == 1);
+  y += rowH;
+  if (kExploreHomeApps) {
+    drawRow(gfx, y, rowH, "Sleep screen", Sleep::faceName(Sleep::face()), _sleepSel == 2);
+    y += rowH;
+  }
+  y += 16;
+
+  // What the two states mean, in the words the posters use.
+  const int lh = gfx.lineHeight(kFontRegular);
+  gfx.drawText(kFontRegular, kMarginX, y, "Nap: the screen rests, the phone");
+  gfx.drawText(kFontRegular, kMarginX, y + lh, "link stays, a press wakes it.");
+  gfx.drawText(kFontRegular, kMarginX, y + 2 * lh + 8, "Off: everything stops. Press");
+  gfx.drawText(kFontRegular, kMarginX, y + 3 * lh + 8, "power to start again.");
+  if (kExploreHomeApps) {
+    gfx.drawText(kFontRegular, kMarginX, y + 4 * lh + 16, "Sleep screen: Priorities, or the");
+    gfx.drawText(kFontRegular, kMarginX, y + 5 * lh + 16, "last home page (Widget home).");
+  } else {
+    gfx.drawText(kFontRegular, kMarginX, y + 4 * lh + 16, "While a block runs, the nap");
+    gfx.drawText(kFontRegular, kMarginX, y + 5 * lh + 16, "comes after 2 minutes.");
+  }
+}
+
+void SettingsScene::enterSleepPick() {
+  // Land on the current value, so SELECT with no move changes nothing.
+  const bool nap = _sleepSel == 0;
+  const int n = nap ? Sleep::napChoiceCount() : Sleep::offChoiceCount();
+  const uint16_t cur = nap ? Sleep::napAfterMin() : Sleep::offAfterMin();
+  _sleepPickSel = 0;
+  for (int i = 0; i < n; i++) {
+    if ((nap ? Sleep::napChoiceAt(i) : Sleep::offChoiceAt(i)) == cur) _sleepPickSel = i;
+  }
+  _view = View::SleepPick;
+  markDirty();
+}
+
+void SettingsScene::renderSleepPick(Gfx& gfx) {
+  const bool nap = _sleepSel == 0;
+  drawHeader(gfx, nap ? "Nap after" : "Off after", nullptr);
+  int y = kHeaderH + 8;
+  const int lh = gfx.lineHeight(kFontRegular);
+  // Two lines on what the choice means, in the poster's words.
+  gfx.drawText(kFontRegular, kMarginX, y, nap ? "Idle time before the screen rests." : "Nap time before everything stops.");
+  gfx.drawText(kFontRegular, kMarginX, y + lh, nap ? "The phone link stays." : "Never keeps it awake.");
+  y += 2 * lh + 12;
+
+  const int rowH = gfx.lineHeight(kFontBold) + kRowPad;
+  const int n = nap ? Sleep::napChoiceCount() : Sleep::offChoiceCount();
+  const uint16_t cur = nap ? Sleep::napAfterMin() : Sleep::offAfterMin();
+  for (int i = 0; i < n; i++) {
+    const uint16_t v = nap ? Sleep::napChoiceAt(i) : Sleep::offChoiceAt(i);
+    char label[16];
+    Sleep::formatMinutes(label, sizeof(label), v);
+    drawRow(gfx, y, rowH, label, v == cur ? "current" : nullptr, i == _sleepPickSel);
+    y += rowH;
+  }
 }
 
 void SettingsScene::renderIconStyle(Gfx& gfx) {
@@ -436,6 +604,12 @@ void SettingsScene::render(Gfx& gfx) {
       break;
     case View::ConfirmRestart:
       renderConfirmRestart(gfx);
+      break;
+    case View::Sleep:
+      renderSleep(gfx);
+      break;
+    case View::SleepPick:
+      renderSleepPick(gfx);
       break;
     case View::IconStyle:
       renderIconStyle(gfx);

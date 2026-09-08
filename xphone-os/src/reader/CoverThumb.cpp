@@ -7,9 +7,10 @@
 //    rows into the target row accumulators.
 //  - PNG (PNGdec): scanlines arrive top-to-bottom via PNG_DRAW; each line is
 //    converted to 8-bit gray and box-sampled the same way.
-// Target rows are Bayer-8x8 ordered-dithered to 1bpp as they complete and
-// written straight to the output file, so the accumulator footprint is just
-// 2 x 4 x outW bytes regardless of source size.
+// Gray target rows stage to a small SD temp as they complete; finish() then
+// runs the tone pass (auto-contrast + unsharp, bookc parity) and Floyd-
+// Steinberg into the output, so RAM stays a few row buffers regardless of
+// source size.
 #include "CoverThumb.h"
 
 #include <Arduino.h>
@@ -89,13 +90,6 @@ enum class DecodeResult { Ok, Transient, Permanent };
 
 enum class ImgFormat { Jpeg, Png, Unknown };
 
-// Standard Bayer 8x8 ordered-dither matrix (0..63).
-const uint8_t kBayer8[8][8] = {
-    {0, 32, 8, 40, 2, 34, 10, 42},   {48, 16, 56, 24, 50, 18, 58, 26}, {12, 44, 4, 36, 14, 46, 6, 38},
-    {60, 28, 52, 20, 62, 30, 54, 22}, {3, 35, 11, 43, 1, 33, 9, 41},   {51, 19, 59, 27, 49, 17, 57, 25},
-    {15, 47, 7, 39, 13, 45, 5, 37},  {63, 31, 55, 23, 61, 29, 53, 21},
-};
-
 // Aspect-preserving fit of srcW x srcH within maxW x maxH, never upscaling
 // past 1:1. 16.16 fixed point; outputs are always >= 1.
 void fitWithin(const int srcW, const int srcH, const int maxW, const int maxH, int* outW, int* outH) {
@@ -111,10 +105,21 @@ void fitWithin(const int srcW, const int srcH, const int maxW, const int maxH, i
 }
 
 // Streams monotonically-increasing source rows in, box-samples them into
-// target rows and writes each finished row (Bayer-dithered, bit-packed
-// MSB-first, set bit = ink) straight to the output file.
+// GRAY target rows staged in a temp file, then finish() runs the tone pass
+// (auto-contrast + gentle unsharp, mirroring bookc's punch_gray) and
+// Floyd-Steinberg dither into the output file (bit-packed MSB-first, set
+// bit = ink). The old path Bayer-dithered rows as they streamed, which
+// could never normalize contrast — a midtone cover came out flat gray fog,
+// visibly weaker than stock readers (Andrew, 2026-09-01). Staging costs a
+// <=52 KB temp on SD and ~2.5 KB of RAM for the second pass; the decode
+// itself still streams in bands.
 struct ThumbWriter {
+  // Single-task use, like every SD path in the reader; the file is deleted
+  // in finish() on every outcome.
+  static constexpr const char* kGrayTmpPath = "/.xphone/cover.gray.tmp";
+
   HalFile* out = nullptr;
+  HalFile tmp;
   int srcW = 0, srcH = 0;
   int outW = 0, outH = 0;
   int rowBytes = 0;
@@ -124,9 +129,10 @@ struct ThumbWriter {
   std::unique_ptr<uint32_t[]> accum;  // per-output-column gray sums for the current band
   std::unique_ptr<uint32_t[]> count;  // matching sample counts
   uint8_t packed[kMaxRowBytes];
+  uint8_t grayRow[kMaxRowBytes * 8];
 
-  // Allocates the accumulators and writes the 8-byte header. False on OOM or
-  // a short write.
+  // Allocates the accumulators, opens the gray staging file, and writes the
+  // 8-byte header to the output. False on OOM or a short write.
   bool init(HalFile* o, const int sw, const int sh, const int ow, const int oh) {
     out = o;
     srcW = sw;
@@ -143,6 +149,10 @@ struct ThumbWriter {
       LOG_ERR("CVR", "OOM: thumb accumulators (%d bytes)", ow * 8);
       return false;
     }
+    if (!Storage.openFileForWrite("CVR", kGrayTmpPath, tmp)) {
+      LOG_ERR("CVR", "gray staging open failed");
+      return false;
+    }
     const uint8_t hdr[kHeaderSize] = {
         static_cast<uint8_t>(kMagic & 0xFF),  static_cast<uint8_t>(kMagic >> 8),
         kVersion,                             0,
@@ -152,22 +162,125 @@ struct ThumbWriter {
     return out->write(hdr, kHeaderSize) == kHeaderSize;
   }
 
-  // Dither + pack + write the current target row, then reset the accumulators.
+  // Average + write the current GRAY target row to the staging file, then
+  // reset the accumulators. Dithering waits for finish(), which knows the
+  // whole image's tone.
   bool flushRow() {
-    memset(packed, 0, rowBytes);
     for (int x = 0; x < outW; x++) {
       // No samples (rounding edge) reads as paper, not ink.
-      const uint8_t gray = count[x] ? static_cast<uint8_t>(accum[x] / count[x]) : 255;
-      const uint8_t threshold = kBayer8[currentOutY & 7][x & 7] * 4 + 2;
-      if (gray < threshold) packed[x >> 3] |= 0x80 >> (x & 7);
+      grayRow[x] = count[x] ? static_cast<uint8_t>(accum[x] / count[x]) : 255;
     }
-    if (out->write(packed, rowBytes) != static_cast<size_t>(rowBytes)) {
-      LOG_ERR("CVR", "Short write on thumb row %d", currentOutY);
+    if (tmp.write(grayRow, outW) != static_cast<size_t>(outW)) {
+      LOG_ERR("CVR", "Short write on gray row %d", currentOutY);
       return false;
     }
     currentOutY++;
     memset(accum.get(), 0, outW * sizeof(uint32_t));
     memset(count.get(), 0, outW * sizeof(uint32_t));
+    return true;
+  }
+
+  // The tone pass: histogram over the staged gray, stretch the 2nd..98th
+  // percentile to full range (skipped when already narrow — line art and
+  // solid covers stay untouched), a 0.5-amount 3x3 unsharp, then Floyd-
+  // Steinberg into the output. Mirrors bookc's punch_gray + dither_pack so
+  // device-decoded covers match package thumbs.
+  bool tonePass() {
+    if (!Storage.openFileForRead("CVR", kGrayTmpPath, tmp)) return false;
+    uint32_t hist[256] = {0};
+    for (int y = 0; y < outH; y++) {
+      if (tmp.read(grayRow, outW) != static_cast<size_t>(outW)) return false;
+      for (int x = 0; x < outW; x++) hist[grayRow[x]]++;
+    }
+    const uint32_t n = static_cast<uint32_t>(outW) * static_cast<uint32_t>(outH);
+    const uint32_t need = n / 50; /* 2% */
+    uint32_t acc = 0;
+    int lo = 0, hi = 255;
+    for (int v = 0; v < 256; v++) {
+      acc += hist[v];
+      if (acc > need) {
+        lo = v;
+        break;
+      }
+    }
+    acc = 0;
+    for (int v = 255; v >= 0; v--) {
+      acc += hist[v];
+      if (acc > need) {
+        hi = v;
+        break;
+      }
+    }
+    uint8_t lut[256];
+    for (int v = 0; v < 256; v++) {
+      if (hi - lo < 32) {
+        lut[v] = static_cast<uint8_t>(v);
+      } else {
+        int s = (v - lo) * 255 / (hi - lo);
+        lut[v] = static_cast<uint8_t>(s < 0 ? 0 : s > 255 ? 255 : s);
+      }
+    }
+
+    // Rolling three LUT'd rows for the unsharp, two error rows for FS.
+    auto rows = makeUniqueNoThrow<uint8_t[]>(3 * outW);
+    auto err = makeUniqueNoThrow<int16_t[]>(2 * (outW + 2));
+    if (!rows || !err) return false;
+    memset(err.get(), 0, 2 * (outW + 2) * sizeof(int16_t));
+    uint8_t* r[3] = {rows.get(), rows.get() + outW, rows.get() + 2 * outW};
+    int16_t* cur = err.get() + 1;
+    int16_t* next = err.get() + (outW + 2) + 1;
+
+    if (!tmp.seek(0)) return false;  // the staging file is raw rows, no header
+    auto loadRow = [&](uint8_t* dst) -> bool {
+      if (tmp.read(grayRow, outW) != static_cast<size_t>(outW)) return false;
+      for (int x = 0; x < outW; x++) dst[x] = lut[grayRow[x]];
+      return true;
+    };
+    if (!loadRow(r[0])) return false;
+    memcpy(r[1], r[0], outW);  // virtual row above the top edge
+
+    for (int y = 0; y < outH; y++) {
+      // r[1] = row y (LUT'd), r[0] = y-1, r[2] = y+1 (edge rows repeat).
+      uint8_t* above = r[0];
+      uint8_t* mid = r[1];
+      uint8_t* below = r[2];
+      if (y + 1 < outH) {
+        if (!loadRow(below)) return false;
+      } else {
+        memcpy(below, mid, outW);
+      }
+
+      memset(next - 1, 0, (outW + 2) * sizeof(int16_t));
+      memset(packed, 0, rowBytes);
+      for (int x = 0; x < outW; x++) {
+        const int xl = x > 0 ? x - 1 : 0;
+        const int xr = x + 1 < outW ? x + 1 : outW - 1;
+        const int blur = (above[xl] + above[x] + above[xr] + mid[xl] + mid[x] + mid[xr] +
+                          below[xl] + below[x] + below[xr]) /
+                         9;
+        int v = mid[x] + (mid[x] - blur) / 2;
+        v = v < 0 ? 0 : v > 255 ? 255 : v;
+        v += cur[x];
+        const int on = v < 128;
+        const int e = v - (on ? 0 : 255);
+        if (on) packed[x >> 3] |= static_cast<uint8_t>(0x80 >> (x & 7));
+        cur[x + 1] += static_cast<int16_t>(e * 7 / 16);
+        next[x - 1] += static_cast<int16_t>(e * 3 / 16);
+        next[x] += static_cast<int16_t>(e * 5 / 16);
+        next[x + 1] += static_cast<int16_t>(e * 1 / 16);
+      }
+      if (out->write(packed, rowBytes) != static_cast<size_t>(rowBytes)) {
+        LOG_ERR("CVR", "Short write on thumb row %d", y);
+        return false;
+      }
+      int16_t* t = cur;
+      cur = next;
+      next = t;
+      uint8_t* rt = above;
+      r[0] = mid;
+      r[1] = below;
+      r[2] = rt;
+    }
     return true;
   }
 
@@ -201,12 +314,19 @@ struct ThumbWriter {
   }
 
   // Flush a trailing partially-accumulated row (fixed-point truncation can
-  // leave the final target row pending) and pad to exactly outH rows.
+  // leave the final target row pending), pad to exactly outH gray rows,
+  // then run the tone pass into the output. The staging file dies here on
+  // every outcome.
   bool finish() {
     while (currentOutY < outH) {
       if (!flushRow()) return false;
     }
-    return true;
+    tmp.flush();
+    tmp.close();
+    const bool ok = tonePass();
+    tmp.close();
+    Storage.remove(kGrayTmpPath);
+    return ok;
   }
 };
 
@@ -714,10 +834,12 @@ bool CoverThumb::ensure(Epub& epub, const int w, const int h, std::string* outPa
 }
 
 void CoverThumb::preacquireScratch() {
-  // Union of both decoder structs — grow-only acquire keeps this block for
-  // every later per-format request in the same grid session.
+  // Claim the JPEG decoder's size (~21 KB), not the union with PNG (~58 KB):
+  // most covers are JPEG, and the grow-only acquire re-sizes the block the
+  // first time a PNG shows up. Claiming the union up front cost ~37 KB of
+  // peak heap on every shelf entry for nothing (efficiency audit 2026-09-02).
   g_scratchFailedNeed = 0;  // fresh scene, fresh heap — allow one new attempt
-  acquireDecoderScratch(sizeof(PNG) > sizeof(JPEGDEC) ? sizeof(PNG) : sizeof(JPEGDEC));
+  acquireDecoderScratch(sizeof(JPEGDEC));
 }
 
 void CoverThumb::releaseScratch() {

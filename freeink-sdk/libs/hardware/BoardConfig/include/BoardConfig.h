@@ -565,7 +565,7 @@ constexpr BoardProfile XTEINK_X4 = {Board::XteinkX4,
                                     800,
                                     480,
                                     {8, 10, 21, 4, 5, 6, PIN_UNASSIGNED},
-                                    5000000,  // displaySpiHz: stock X4 display bus speed
+                                    10000000,  // displaySpiHz: 10 MHz (stock ran 5; the UC8279 sibling runs 20). P3 2026-09-03
                                     {PIN_UNASSIGNED, 7, PIN_UNASSIGNED, 12, PIN_UNASSIGNED, false, 0},
                                     {0, 1, 2, 3, 4, 5, 3, false},
                                     0,

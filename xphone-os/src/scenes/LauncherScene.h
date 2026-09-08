@@ -8,6 +8,7 @@
 
 class LauncherScene : public Scene {
  public:
+  void onEnter() override;  // reloads the six slots from NVS
   void handleInput(Input& in) override;
   void render(Gfx& gfx) override;
   const char* const* softKeys() const override;  // [gear] / OPEN / PREV / NEXT
@@ -20,7 +21,20 @@ class LauncherScene : public Scene {
   // navigation is fact-based, never dead reckoning.
   int selection() const { return _sel; }
 
+  // Phase 3: the six slots come from NVS ("homeSlots" csv: builtin ids or
+  // installed app names). applyHomeConfigLive() calls this after a
+  // home.layout card.
+  void loadSlots();
+
  private:
+  struct Slot {
+    char id[32];      // builtin id or app dir name
+    char label[20];   // what the tile says
+    int8_t icon;      // LauncherIcons index, -1 = installed app (monogram)
+  };
+  Slot _slots[APP_COUNT];
+  bool _slotsLoaded = false;
+
   void moveSelection(int dCol, int dRow);
   // Logical rect of grid cell i (tile + label, small slop), from the layout
   // cached by render(). Empty rect until the first render.

@@ -123,6 +123,13 @@ class CompanionAncsClient final {
   bool isBackfillFetchInFlight() const { return fetchInFlight; }
 
 #if defined(CONFIG_NIMBLE_ENABLED)
+  // Radio knob (bench): peripheral latency for the low-duty request; sets
+  // it and re-arms the request so it goes out on the next pump.
+  void setLowDutyLatency(uint16_t lat);
+  // Ask for the low-duty set again (after the Bluetooth slow lane ran the
+  // link fast). Same one-shot path as the post-subscribe request.
+  void rearmConnParams();
+  bool isAncsReady() const { return ancsReady; }
   void handleServerConnect(uint16_t connHandle);
   void handleServerDisconnect(uint16_t connHandle);
   void handleAuthenticationComplete(ble_gap_conn_desc* desc);
@@ -147,6 +154,7 @@ class CompanionAncsClient final {
   bool discovering = false;
   bool ancsReady = false;
   uint16_t connHandle = 0xffff;
+  uint16_t lowDutyLatency = 4;
   uint16_t serviceStartHandle = 0;
   uint16_t serviceEndHandle = 0;
   uint16_t notificationSourceHandle = 0;

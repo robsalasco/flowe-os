@@ -52,13 +52,15 @@ void BlockStatusStore::updateFromCard(const CompanionCardState& card) {
   _status.blocksToday = card.blocksToday;
   _status.streak = card.blockStreak;
   _status.total = card.blocksTotal;
+  _status.minutesToday = card.blockMinutesToday;
   _status.revision++;
 }
 
-void BlockStatusStore::seedCounts(int blocksToday, int streak, int total) {
+void BlockStatusStore::seedCounts(int blocksToday, int streak, int total, int minutesToday) {
   _status.blocksToday = blocksToday;
   _status.streak = streak;
   _status.total = total;
+  _status.minutesToday = minutesToday;
   _status.revision++;
 }
 

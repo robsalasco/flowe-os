@@ -31,6 +31,15 @@ class FileTransferServer {
   bool begin();
   void stop();
   bool isRunning() const { return _running; }
+  // Set by POST /stop. The handler runs INSIDE handleClient(), so it must
+  // not tear the server down under itself; it answers 200 and raises this
+  // flag, and the scene ends the session on its next tick (no-restart
+  // exit, 2026-09-04).
+  bool stopRequested() const { return _stopRequested; }
+  // Bench lever (devcon 'isolate on'): accept connections but never answer,
+  // the way a guest network with client isolation looks from the phone.
+  // Drives the device-side reach test (no knock in 20 s -> hotspot).
+  static bool isolate;
 
   // Pump pending HTTP work; one call handles at most one full request
   // (Arduino WebServer processes a request synchronously inside
@@ -39,6 +48,9 @@ class FileTransferServer {
 
   // Bytes moved since begin() — for the on-screen activity line.
   uint32_t bytesUploaded() const { return _bytesUploaded; }
+  // The URI of the last request handleClient() served ("" before the first).
+  // For the loop-stack probe that names the deepest request.
+  const char* lastUri() const;
   uint32_t bytesDownloaded() const { return _bytesDownloaded; }
   uint16_t requestCount() const { return _requestCount; }
 
@@ -55,9 +67,13 @@ class FileTransferServer {
     // CrossPoint measured this as the sweet spot between syscall overhead
     // and per-write watchdog headroom (CrossPointWebServer.h:44).
     static constexpr size_t kBufferSize = 4096;
-    uint8_t buffer[kBufferSize];
+    // Heap, owned by begin()/stop(): transfer mode is the emptiest heap the
+    // device ever has (Wi-Fi up, BLE down). Keeping this in BSS cost 4 KB
+    // of every other scene's memory (efficiency audit 2026-09-02).
+    uint8_t* buffer = nullptr;
     size_t bufferPos = 0;
     char path[192] = {0};  // final SD path of the file being written
+  char part[200] = {0};  // <path>.part; renamed to path on a clean end
     bool fileOpen = false;
     bool failed = false;
     size_t received = 0;
@@ -85,6 +101,7 @@ class FileTransferServer {
   std::unique_ptr<WebServer> _server;
   UploadState _upload;
   bool _running = false;
+  bool _stopRequested = false;
   uint32_t _bytesUploaded = 0;
   uint32_t _bytesDownloaded = 0;
   uint32_t _hookMark = 0;

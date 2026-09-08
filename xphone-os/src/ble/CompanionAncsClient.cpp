@@ -30,6 +30,9 @@
 
 namespace {
 constexpr uint16_t NO_CONN_HANDLE = 0xffff;
+// 512. A 256-byte trim (2026-09-02 P5) clipped real fragments: the log
+// showed 16 "data fragment bytes=256; waiting for more" lines in half an
+// hour, so the negotiated MTU is larger than 256 and fragments are too.
 constexpr std::size_t MAX_ANCS_VALUE_BYTES = 512;
 
 // Data Source fragment marshalled from the NimBLE host task to the main loop.
@@ -985,6 +988,23 @@ void CompanionAncsClient::handleNotificationSourceSubscribed() {
 // Tradeoff: latency 4 @ 180 ms means worst-case ~0.9 s notification latency —
 // invisible next to an e-ink refresh, while connected-idle radio wakeups drop
 // roughly 10-40x vs the ~15 ms interval iOS grants during setup.
+void CompanionAncsClient::setLowDutyLatency(const uint16_t lat) {
+  ensureMutex();
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  lowDutyLatency = lat;
+  connParamUpdatePending = true;
+  connParamUpdateDueMs = millis();
+  xSemaphoreGive(stateMutex);
+}
+
+void CompanionAncsClient::rearmConnParams() {
+  ensureMutex();
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  connParamUpdatePending = true;
+  connParamUpdateDueMs = millis();
+  xSemaphoreGive(stateMutex);
+}
+
 void CompanionAncsClient::maybeRequestConnParams() {
   ensureMutex();
   xSemaphoreTake(stateMutex, portMAX_DELAY);
@@ -998,8 +1018,12 @@ void CompanionAncsClient::maybeRequestConnParams() {
   ble_gap_upd_params params = {};
   params.itvl_min = 72;              // 90 ms  (1.25 ms units)
   params.itvl_max = 144;             // 180 ms (1.25 ms units)
-  params.latency = 4;                // peripheral may skip 4 events
-  params.supervision_timeout = 200;  // 2000 ms (10 ms units)
+  params.latency = lowDutyLatency;   // default 4: peripheral may skip 4 events
+  // Apple's accessory rule: supervision timeout > interval * (latency+1) * 3
+  // = 180 ms * 5 * 3 = 2700 ms, and within 2-6 s. The original 2000 ms
+  // violated the first bound, so iOS silently kept 30 ms / latency 0
+  // (seen live on the About scene, bench 2026-08-31).
+  params.supervision_timeout = 600;  // 6000 ms (10 ms units)
   params.min_ce_len = 0;             // controller default CE length
   params.max_ce_len = 0;
 
@@ -1014,7 +1038,7 @@ void CompanionAncsClient::maybeRequestConnParams() {
   // asynchronously (L2CAP reject / no LL change) — that is fine, the link
   // simply stays on the old parameters. The live values are visible on the
   // About scene via CompanionBleService::getConnParams().
-  LOG_INF("ANCS", "Requested low-duty conn params: 90-180 ms, latency=4, timeout=2000 ms");
+  LOG_INF("ANCS", "Requested low-duty conn params: 90-180 ms, latency=4, timeout=6000 ms");
 }
 
 void CompanionAncsClient::discoverCharacteristics() {
@@ -1828,6 +1852,20 @@ int CompanionAncsClient::handleGapEvent(ble_gap_event* event) {
     COMPANION_BLE.noteActionSubscribe(event->subscribe.conn_handle,
                                       event->subscribe.attr_handle,
                                       event->subscribe.cur_notify);
+    return 0;
+  }
+  // Conn-param grants are otherwise invisible: rc==0 from
+  // ble_gap_update_params only means the request went out, and iOS's answer
+  // never hit the serial. The About scene shows the live values, but the
+  // bench (and the power doc) need them in the log.
+  if (event->type == BLE_GAP_EVENT_CONN_UPDATE) {
+    ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0) {
+      LOG_INF("X4CMP", "conn params now itvl=%ums lat=%u timeout=%ums (status=%d)",
+              static_cast<unsigned>(desc.conn_itvl) * 5u / 4u,
+              static_cast<unsigned>(desc.conn_latency),
+              static_cast<unsigned>(desc.supervision_timeout) * 10u, event->conn_update.status);
+    }
     return 0;
   }
   if (event->type == BLE_GAP_EVENT_ENC_CHANGE) {

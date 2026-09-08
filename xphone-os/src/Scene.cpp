@@ -1,9 +1,15 @@
 #include "Scene.h"
 
+extern bool gDeviceIsX3;  // BoardConfig detect, defined in main.cpp
+#if XP_LIGHT_SLEEP_LIBS
+#include <esp_pm.h>
+#endif
+
 #include <Arduino.h>
 
 #include "Fonts.h"
 #include "scenes/AppScenes.h"
+#include "scenes/HomeScene.h"
 
 SceneManager SCENES;
 RefreshStats gRefreshStats;
@@ -243,8 +249,14 @@ void SceneManager::loop(Input& in, Gfx& gfx) {
     // (scenes cannot override this in this iteration). The event is consumed
     // here — handleInput is skipped this tick, and wasLongPressed is a
     // one-tick flag, so the (possibly new) scene never sees it. A no-op on
-    // the launcher itself (switchTo returns early on the active scene).
-    showLauncher();
+    // the current root itself (switchTo returns early on the active scene).
+    // Phase 2: "home" is the Widget HomeScene when that layout is on —
+    // otherwise the launcher, exactly as before.
+    if (homeLayout() == HomeLayout::Widget) {
+      showHome();
+    } else {
+      showLauncher();
+    }
   } else {
     _active->handleInput(in);
   }
@@ -256,6 +268,15 @@ void SceneManager::loop(Input& in, Gfx& gfx) {
 
 void SceneManager::renderNow() {
   if (_flushGfx) renderIfDirty(*_flushGfx);
+}
+
+void SceneManager::composeActive(Gfx& gfx) {
+  if (!_active) return;
+  waitFlushIdle();
+  gfx.clear();
+  _active->render(gfx);
+  drawSoftKeyBar(gfx, _active->softKeys(), _active->longPressSlots(), _active->softKeyIconMask());
+  _active->clearDirty();
 }
 
 void SceneManager::switchTo(Scene& s) {
@@ -285,16 +306,31 @@ constexpr int kPartialMaxAreaPct = 50;
 // panel conditioning (Uc8253X3Driver.cpp:143 _initialFullSyncsRemaining = 2);
 // partial flushes bypass display(), so hold them back until two full-panel
 // flushes have run through it.
-constexpr uint8_t kConditioningFlushes = 2;
+// The boot splash already runs one full display() before the first scene, so
+// ONE more here completes the X3 driver's two conditioning syncs; holding
+// partial windows back for a second scene flush cost a FAST (~450 ms) for
+// nothing (efficiency audit 2026-09-02).
+constexpr uint8_t kConditioningFlushes = 1;
 }  // namespace
 
 void SceneManager::renderIfDirty(Gfx& gfx) {
+  if (_paused) return;  // the sleep screen owns the glass (nap)
   if (!_active || !_active->isDirty()) return;
+  if (_active->suppressRepaint()) {
+    _active->clearDirty();  // the picture on glass belongs to the scene before
+    return;
+  }
   // M5 Phase 2: a flush is still driving the panel — defer. The scene's dirty
   // state persists and keeps accumulating, so the next compose (right after
   // the worker goes idle) shows the NEWEST state. Input/BLE keep pumping on
   // the loop for the whole waveform instead of blocking inside gfx.flush().
-  if (_flushInFlight) return;
+  if (_flushInFlight) {
+    // Remember that this repaint waited out a full-panel waveform: the panel
+    // cannot take a windowed differential straight afterwards (see
+    // _deferredBehindFullPanel in Scene.h).
+    if (_flushReq != FlushReq::Window) _deferredBehindFullPanel = true;
+    return;
+  }
 
   // M4 power model: the panel controller stays powered for the whole awake
   // session (idle-sleep removed — the only panel deepSleep left is inside
@@ -327,14 +363,29 @@ void SceneManager::renderIfDirty(Gfx& gfx) {
   // HALF scrub bounds the accumulated ghosting (experiment: eyes on glass).
   FlushReq req;
   if (_needFull && _bootFlushes < kConditioningFlushes) {
-    req = FlushReq::Full;  // boot conditioning: the X3 driver needs 2 full syncs
+    // Boot conditioning. The X3 driver needs its full syncs. On the X4 the
+    // warmed HALF is the vendor's own clean (1.7 s); the true FULL is 3.8 s
+    // and a cold boot already showed the splash (docs/eink-panel-notes.md).
+    req = gDeviceIsX3 ? FlushReq::Full : FlushReq::Half;
     _sinceScrub = 0;
     _bootFlushes++;
   } else if (_sinceScrub >= kScrubAfterRefreshes) {
     req = FlushReq::Half;  // periodic ghost scrub (CrossPoint cadence)
     _sinceScrub = 0;
     if (_bootFlushes < kConditioningFlushes) _bootFlushes++;
-  } else if (rectUsable && !_needFull && _bootFlushes >= kConditioningFlushes) {
+  } else if (rectUsable && !_needFull && !_deferredBehindFullPanel &&
+             gDeviceIsX3 && _bootFlushes >= kConditioningFlushes) {
+    // X3 only (2026-09-08). The X4's windowed refresh does not drive its
+    // pixels all the way: leave an app, come back to the launcher, and move
+    // the cursor a few times, and the lower rows wash out to a ghost while
+    // the framebuffer holds a perfect frame. Andrew: "parts of the last
+    // screen come back again and again". Several windows in a row compound
+    // it. It buys almost nothing anyway — a window is 550 to 580 ms against
+    // a full-panel FAST's 594 — because the vendor 0xFC sequence drives the
+    // whole panel either way and only the SPI write is smaller. So the X4
+    // takes the full-panel FAST and keeps a correct screen. The X3's
+    // partial is a different implementation (UC8253 PTL, M5 Phase 3) and
+    // was checked on its own glass, so it keeps the window.
     req = FlushReq::Window;
     _sinceScrub++;  // FAST fallback is differential too — it accrues ghosting
   } else {
@@ -345,6 +396,7 @@ void SceneManager::renderIfDirty(Gfx& gfx) {
 
   _active->clearDirty();
   _needFull = false;
+  _deferredBehindFullPanel = false;
   _composeMs = t1 - t0;
   gRefreshStats.drawMs = _composeMs;
   gRefreshStats.sinceScrub = _sinceScrub;
@@ -391,6 +443,16 @@ void SceneManager::flushWorkLoop() {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     Gfx& gfx = *_flushGfx;
     const XpRect rect = _flushRect;
+#if XP_LIGHT_SLEEP_LIBS
+    // P4: the panel waveform and the SPI bursts must not straddle a light
+    // sleep (or an APB clock change). Held for the whole flush.
+    static esp_pm_lock_handle_t sNoSleep = nullptr;
+    static esp_pm_lock_handle_t sApbMax = nullptr;
+    if (!sNoSleep) esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "flush_ls", &sNoSleep);
+    if (!sApbMax) esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "flush_apb", &sApbMax);
+    esp_pm_lock_acquire(sNoSleep);
+    esp_pm_lock_acquire(sApbMax);
+#endif
     const unsigned long t1 = millis();
     const char* tier = "FAST";
     switch (_flushReq) {
@@ -423,5 +485,9 @@ void SceneManager::flushWorkLoop() {
                   gRefreshStats.drawMs, gRefreshStats.refreshMs, tier, gRefreshStats.sinceScrub,
                   rect.x, rect.y, rect.w, rect.h);
     _flushInFlight = false;  // release AFTER the panel is fully idle
+#if XP_LIGHT_SLEEP_LIBS
+    esp_pm_lock_release(sApbMax);
+    esp_pm_lock_release(sNoSleep);
+#endif
   }
 }

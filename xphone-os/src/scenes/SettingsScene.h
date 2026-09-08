@@ -19,7 +19,7 @@ class SettingsScene : public Scene {
   static constexpr size_t MAX_NAME_LEN = 64;
 
  private:
-  enum class View : uint8_t { Menu, Picker, ConfirmFlash, ConfirmRestart, IconStyle };
+  enum class View : uint8_t { Menu, Picker, ConfirmFlash, ConfirmRestart, IconStyle, Sleep, SleepPick };
 
   struct BinFile {
     char name[MAX_NAME_LEN + 1];
@@ -38,11 +38,16 @@ class SettingsScene : public Scene {
   void renderConfirmFlash(Gfx& gfx);
   void renderConfirmRestart(Gfx& gfx);
   void renderIconStyle(Gfx& gfx);
+  void renderSleep(Gfx& gfx);
+  void renderSleepPick(Gfx& gfx);
+  void enterSleepPick();
   void drawHeader(Gfx& gfx, const char* title, const char* right);
   void drawRow(Gfx& gfx, int y, int rowH, const char* label, const char* value, bool selected);
 
   View _view = View::Menu;
   int _menuSel = 0;
+  int _sleepSel = 0;  // 0 = nap after, 1 = off after
+  int _sleepPickSel = 0;  // row in the choice list for the selected Sleep row
   int _pickSel = 0;
   int _fileCount = 0;
   bool _sdOk = false;

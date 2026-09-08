@@ -37,10 +37,11 @@ void WorkoutStore::updateFromCard(const CompanionCardState& card) {
     snprintf(dst.id, sizeof(dst.id), "%s", src.id.c_str());
     snprintf(dst.name, sizeof(dst.name), "%s", src.name.c_str());
     dst.sets = src.sets < 0 ? 0 : (src.sets > 99 ? 99 : src.sets);
-    dst.done = src.done < 0 ? 0 : (src.done > dst.sets ? dst.sets : src.done);
+    const int cap = dst.sets > 0 ? dst.sets : kOpenCap;  // sets == 0: open set (#19)
+    dst.done = src.done < 0 ? 0 : (src.done > cap ? cap : src.done);
     for (std::size_t j = 0; j < oldCount; j++) {
       if (strcmp(old[j].id, dst.id) == 0) {
-        if (old[j].done > dst.done && old[j].done <= dst.sets) dst.done = old[j].done;
+        if (old[j].done > dst.done && old[j].done <= cap) dst.done = old[j].done;
         break;
       }
     }
@@ -59,8 +60,9 @@ int WorkoutStore::bumpDone(const std::size_t index, const int delta) {
   if (index >= _count) return -1;
   Item& item = _items[index];
   int next = item.done + delta;
+  const int cap = item.sets > 0 ? item.sets : kOpenCap;  // open set: no target
   if (next < 0) next = 0;
-  if (next > item.sets) next = item.sets;
+  if (next > cap) next = cap;
   if (next == item.done) return -1;  // clamp edge — nothing changed
   item.done = next;
   ++_revision;
@@ -71,7 +73,7 @@ void WorkoutStore::tally(int& doneExercises, int& total) const {
   doneExercises = 0;
   total = static_cast<int>(_count);
   for (std::size_t i = 0; i < _count; i++) {
-    if (_items[i].sets > 0 && _items[i].done >= _items[i].sets) ++doneExercises;
+    if (isComplete(_items[i])) ++doneExercises;
   }
 }
 

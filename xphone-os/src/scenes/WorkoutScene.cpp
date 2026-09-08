@@ -74,9 +74,10 @@ void drawPips(Gfx& gfx, const int x, const int y, const int sets, const int done
   }
 }
 
-// "3/10" progress fragment.
+// "3/10" progress fragment; an open set (sets == 0, flowe-os#19) is just "7".
 void formatCount(char* buf, size_t n, const int done, const int sets) {
-  snprintf(buf, n, "%d/%d", done, sets);
+  if (sets > 0) snprintf(buf, n, "%d/%d", done, sets);
+  else snprintf(buf, n, "%d", done);
 }
 
 }  // namespace
@@ -252,7 +253,7 @@ void WorkoutScene::render(Gfx& gfx) {
     WorkoutStore::Item item;
     if (!WORKOUT_STORE.get(static_cast<std::size_t>(i), item)) break;
     const bool selected = i == _sel;
-    const bool exDone = item.sets > 0 && item.done >= item.sets;
+    const bool exDone = WorkoutStore::isComplete(item);
     const int cardH = rowH - 8;
 
     if (selected) {
@@ -284,6 +285,9 @@ void WorkoutScene::render(Gfx& gfx) {
     const int line2Y = textTop + gfx.lineHeight(titleFont);
     if (item.sets > 0 && item.sets <= kMaxPips) {
       drawPips(gfx, textX, line2Y + (gfx.lineHeight(kFontSmall) - 12) / 2, item.sets, item.done);
+    } else if (item.sets == 0) {
+      // Open set (#19): no target, the count just climbs.
+      gfx.drawText(kFontSmall, textX, line2Y, "open set");
     } else {
       char caption[32];
       snprintf(caption, sizeof(caption), exDone ? "done" : "%d sets", item.sets);
@@ -332,7 +336,7 @@ bool WorkoutScene::renderDormant(Gfx& gfx) {
   for (int i = 0; i < rows; i++) {
     WorkoutStore::Item item;
     if (!WORKOUT_STORE.get(static_cast<std::size_t>(i), item)) break;
-    const bool exDone = item.sets > 0 && item.done >= item.sets;
+    const bool exDone = WorkoutStore::isComplete(item);
     const XpFont& font = exDone ? kFontRegular : kFontBold;  // what's left leads
     drawCheckbox(gfx, boxX, y + (rowH - kCheckboxSize) / 2, exDone, 2);
 

@@ -51,7 +51,20 @@ class Input {
   // deliberate tap, shorter than the SDK's own 650ms confirm-back hold.
   static constexpr unsigned long kLongPressMs = 550;
 
-  void begin() { _mgr.begin(); }  // pinMode + ADC attenuation per BoardConfig
+  void begin() {
+    _mgr.begin();  // pinMode + ADC attenuation per BoardConfig
+    // The power button's press edge is stamped by an interrupt: the idle
+    // sampler runs every 50 ms, and a quick tap used to start late or fall
+    // between two samples (2026-09-05). The release is still sampled; the
+    // hold is measured from the edge.
+    sInstance = this;
+    // The press that woke the device from deep sleep is usually still down
+    // at boot: ignore the power button until the sampler has seen it
+    // released, or that same press reads as a nap tap right after the wake
+    // (Andrew, 2026-09-05, 22:15).
+    _powerIgnoreUntilUp = true;
+    attachInterrupt(digitalPinToInterrupt(InputManager::POWER_BUTTON_PIN), &Input::powerIsr, FALLING);
+  }
 
   // Phase 1: start the dedicated 5 ms sampling task. After this, the SDK
   // manager is owned by that task and update() only drains latched events.
@@ -64,6 +77,7 @@ class Input {
   // during teardown. (Wake from X3 sleep is a full power-on reset, so there
   // is no resume path — suspend is enough.)
   void suspendTask() {
+    detachInterrupt(digitalPinToInterrupt(InputManager::POWER_BUTTON_PIN));
     if (_task) vTaskSuspend(_task);
   }
 
@@ -81,6 +95,9 @@ class Input {
     _pendingTap = 0;
     _pendingLong = 0;
     _pendingAny = false;
+    _powerRelThisTick = _powerRelPending;
+    _powerRelHeld = _powerRelHeldMs;
+    _powerRelPending = false;
     portEXIT_CRITICAL(&_mux);
     for (uint8_t i = 0; i < kBtnCount; i++) {
       _tap[i] = tap & (1u << i);
@@ -99,6 +116,24 @@ class Input {
   bool isPressed(Btn b) const { return _levelMask & (1u << static_cast<uint8_t>(b)); }
   // Any ladder press edge since the last update() drain (idle-timer reset).
   bool wasAnyPressed() const { return _anyThisTick; }
+  // A completed tap or long press on one of the six face buttons this tick.
+  // Unlike wasAnyPressed(), the power button is NOT included: its press-down
+  // woke the nap and its release then napped it again (Andrew, 2026-09-05).
+  bool anyFaceTap() const {
+    for (uint8_t i = 0; i < kBtnCount; i++) {
+      if (_tap[i] || _long[i]) return true;
+    }
+    return false;
+  }
+  // Milliseconds since any ladder button was down or changed (task clock).
+  uint32_t msSinceActivity() const { return millis() - _lastActivityMs; }
+  // Idle sampling slice (light-sleep builds): the button-check cadence once
+  // nothing has been pressed for a second. Also the worst-case press delay.
+  static uint32_t& idleSampleMs() {
+    static uint32_t ms = 50;
+    return ms;
+  }
+  void noteActivity() { _lastActivityMs = millis(); }
 
   // Bench dev console (main.cpp pumpDevConsole): inject a synthetic TAP or
   // LONG-PRESS as if the sampling task had latched it — drains through
@@ -136,9 +171,24 @@ class Input {
   // by the sampling task; single-word volatile reads are atomic on the C3.
   bool powerPressed() const { return _powerDown; }
   unsigned long powerHeldMs() const { return _powerHeldMs; }
+  // A completed power press this tick, with the hold the task measured. The
+  // release is latched by the 5 ms task, so a quick tap can no longer fall
+  // between the 50 ms idle slices of the main loop (2026-09-05).
+  bool powerReleased(unsigned long& heldMs) const {
+    if (!_powerRelThisTick) return false;
+    heldMs = _powerRelHeld;
+    return true;
+  }
+  // Bench: a synthetic power press of `ms` (the task reads it as the pin).
+  void injectPower(uint32_t ms) {
+    _powerInjectUntilMs = millis() + ms;
+    _powerEdgeMs = millis();
+    _powerEdgeSeen = true;
+  }
 
  private:
   static constexpr uint8_t kBtnCount = static_cast<uint8_t>(Btn::COUNT);
+  volatile uint32_t _lastActivityMs = 0;
 
   // Fixed logical -> SDK physical index map.
   static constexpr uint8_t kMap[kBtnCount] = {
@@ -148,10 +198,27 @@ class Input {
 
   static void taskTrampoline(void* self) { static_cast<Input*>(self)->taskLoop(); }
 
+  static Input* sInstance;
+  static void IRAM_ATTR powerIsr() {
+    if (!sInstance) return;
+    sInstance->_powerEdgeMs = millis();
+    sInstance->_powerEdgeSeen = true;
+    sInstance->_lastActivityMs = millis();  // sampling returns to 5 ms at once
+  }
+
   [[noreturn]] void taskLoop() {
     TickType_t last = xTaskGetTickCount();
     for (;;) {
+#if XP_LIGHT_SLEEP_LIBS
+      // P4: 5 ms while anything is pressed or was within the last second,
+      // 50 ms slices once idle — a 5 ms wake cadence never leaves the idle
+      // task the 3 ticks it needs to enter light sleep. Worst case the first
+      // press after idle registers ~50 ms late (Andrew: acceptable).
+      const TickType_t period = pdMS_TO_TICKS(msSinceActivity() > 1000 ? idleSampleMs() : 5);
+      vTaskDelayUntil(&last, period);
+#else
       vTaskDelayUntil(&last, pdMS_TO_TICKS(5));
+#endif
       sampleOnce();
     }
   }
@@ -165,6 +232,7 @@ class Input {
     for (uint8_t i = 0; i < kBtnCount; i++) {
       const bool down = _mgr.isPressed(kMap[i]);
       if (down) levels |= (1u << i);
+      if (down) _lastActivityMs = now;
       if (down) {
         if (!_held[i]) {  // press edge: start the hold clock
           _held[i] = true;
@@ -197,8 +265,74 @@ class Input {
       _holdInjectMask = 0;
     }
     _levelMask = levels | injected;
-    _powerDown = _mgr.isPressed(InputManager::BTN_POWER);
-    _powerHeldMs = _mgr.getPowerButtonHeldTime();
+    // Power button, task-side: counts as activity (so sampling returns to 5 ms
+    // at once), its hold runs on our own clock, and the release edge is
+    // latched with that hold for the main loop to take.
+    bool pdown = _mgr.isPressed(InputManager::BTN_POWER);
+    if (_powerInjectUntilMs) {
+      if (static_cast<int32_t>(millis() - _powerInjectUntilMs) < 0) pdown = true;
+      else _powerInjectUntilMs = 0;
+    }
+    // The interrupt fires on every falling edge, bounces included. A bounce
+    // on RELEASE used to read as a second press (Andrew, 2026-09-05: "tap to
+    // wake and it goes right back to sleep"), so edges inside a short quiet
+    // window after a release are ignored, and a press the interrupt saw but
+    // the sampler never did (a quick tap between samples) counts as a
+    // nominal tap rather than as the sampling delay.
+    // One physical press must be ONE press. The interrupt sees it first; the
+    // SDK's debounce reports the pin low a few samples later, while the
+    // finger is still down. So a press the interrupt started stays open
+    // until the sampler sees the real release; only if the sampler never
+    // saw the pin low at all (a very quick tap) does it close by itself
+    // after a short grace, as a nominal tap. (Andrew, 2026-09-05: one tap
+    // read as nap + wake, "it flashes back awake".)
+    constexpr unsigned long kPowerQuietMs = 250;
+    constexpr unsigned long kEdgeGraceMs = 150;
+    constexpr unsigned long kEdgeOnlyTapMs = 40;
+    bool edge = _powerEdgeSeen;
+    _powerEdgeSeen = false;
+    if (_powerIgnoreUntilUp) {
+      if (pdown) { _lastActivityMs = now; _powerDown = true; return; }  // still the wake press
+      _powerIgnoreUntilUp = false;
+      _powerLastReleaseMs = now;  // and a quiet window after it
+      edge = false;
+    }
+    if (edge && !_powerHeld && now - _powerLastReleaseMs >= kPowerQuietMs) {
+      _powerHeld = true;
+      _powerEdgeOnly = true;
+      _powerPressStartMs = _powerEdgeMs;
+    }
+    bool completed = false;
+    unsigned long held = 0;
+    if (pdown) {
+      _lastActivityMs = now;
+      if (!_powerHeld) {
+        _powerHeld = true;
+        _powerPressStartMs = now;
+      }
+      _powerEdgeOnly = false;  // the sampler saw the pin low: this press ends on its real release
+      _powerHeldMs = now - _powerPressStartMs;
+    } else if (_powerHeld) {
+      if (_powerEdgeOnly) {
+        if (now - _powerPressStartMs >= kEdgeGraceMs) {  // the sampler never saw it: a quick tap
+          completed = true;
+          held = kEdgeOnlyTapMs;
+        }
+      } else {
+        completed = true;
+        held = now - _powerPressStartMs;
+      }
+    }
+    if (completed) {
+      _powerHeld = false;
+      _powerEdgeOnly = false;
+      _powerLastReleaseMs = now;
+      portENTER_CRITICAL(&_mux);
+      _powerRelHeldMs = held;
+      _powerRelPending = true;
+      portEXIT_CRITICAL(&_mux);
+    }
+    _powerDown = pdown;
   }
 
   InputManager _mgr;  // task-owned once beginTask() runs
@@ -208,6 +342,18 @@ class Input {
   // Tap/long-press machine state (sampling context only).
   unsigned long _pressStartMs[kBtnCount] = {};
   bool _held[kBtnCount] = {};
+  bool _powerHeld = false;
+  unsigned long _powerPressStartMs = 0;
+  volatile bool _powerRelPending = false;
+  volatile unsigned long _powerRelHeldMs = 0;
+  bool _powerRelThisTick = false;
+  unsigned long _powerRelHeld = 0;
+  volatile uint32_t _powerInjectUntilMs = 0;
+  volatile unsigned long _powerEdgeMs = 0;
+  volatile bool _powerEdgeSeen = false;
+  bool _powerEdgeOnly = false;
+  bool _powerIgnoreUntilUp = false;
+  unsigned long _powerLastReleaseMs = 0;
   bool _longFired[kBtnCount] = {};
 
   // Latches: sampling context -> main loop (guarded by _mux).

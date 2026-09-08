@@ -28,12 +28,22 @@ class FbpBook {
   // Pick the profile set for this viewport; prefer_px 0 = middle size.
   bool selectProfile(uint16_t w, uint16_t h, uint16_t prefer_px);
   bool profileSelected() const { return _profSelected; }
+  // The last selectProfile() failed because no page buffer would fit the
+  // heap, not because the package lacks this geometry. The reader answers
+  // the two differently (2026-09-06: "Package profile mismatch" on glass
+  // after a Wi-Fi session that left 17 KB free).
+  bool lastFailNoMemory() const { return _oom; }
 
   uint16_t pageCount() const { return _geo[_profIdx].page_count; }
   uint16_t pxSize() const { return _geo[_profIdx].px_size; }
   // How many sizes this geometry offers. 1 usually means a foreign package
   // (built for another panel) opened through the fallback in selectProfile.
   int sizeCount() const { return _nGeo; }
+  // Rank of the size in use, 0 = smallest. bookc writes each geometry's
+  // profiles in ascending px order, so the array index IS the rank — the
+  // size strip highlights by rank, never by absolute px (packages come in
+  // different size families: apps 22/26/30, the Press 14/18/22).
+  int sizeIndex() const { return _profIdx; }
   // Focus edition (bookc --focus): word-prefix runs are pre-bolded into the
   // page records. ProfileDir.reserved[0] bit0, already resident once a
   // profile is selected. The shelf badges these; the reader needs to say so
@@ -44,10 +54,14 @@ class FbpBook {
 
   bool renderPage(Gfx& gfx, uint16_t page);
 
-  // Switch to the next size in this geometry. Returns the page in the new
-  // profile that holds the same first paragraph (content ID) the current
-  // page showed — the position survives the re-pagination exactly.
-  bool cycleSize(uint16_t cur_page, uint16_t* new_page);
+  // Step one size up (dir > 0) or down (dir < 0) in this geometry,
+  // wrapping at the ends. Returns the page in the new profile that holds
+  // the same first paragraph (content ID) the current page showed — the
+  // position survives the re-pagination exactly. On failure (the new
+  // profile's page buffer cannot allocate in the current heap) the
+  // PREVIOUS profile is restored and reading continues at the old size —
+  // it must never leave the book unrenderable.
+  bool stepSize(int dir, uint16_t cur_page, uint16_t* new_page);
 
   // Reader menu "Orientation": does this package carry profiles for the
   // given viewport? Landscape editions (bookc --landscape) add them; a
@@ -58,15 +72,38 @@ class FbpBook {
   bool selectProfileFresh(uint16_t w, uint16_t h);
   // The page's paragraph anchor, for carrying a position across a
   // re-pagination (orientation or size change).
-  bool pageFirstCidPublic(uint16_t page, uint32_t* cid);
+  // Page anchors. Every page record carries TWO counters and they are not
+  // interchangeable: the first PARAGRAPH content id (what TOC entries,
+  // bookmarks and goto commands speak) and the first SENTENCE id (finer;
+  // what size/orientation carries speak). Mixing them was the lands-early
+  // chapter-jump bug (fixed 2026-09-01).
+  bool pageFirstCidPublic(uint16_t page, uint32_t* cid);  // PARAGRAPH id
+  bool pageFirstSidPublic(uint16_t page, uint32_t* sid);  // SENTENCE id
 
   // Reader menu "Chapters": the package's table of contents (compiler-
   // written FbpTocEnt records: paragraph content_id + title[48]).
   uint32_t tocCount() const { return _hdr.toc_count; }
   bool tocEntry(uint32_t i, char* title, size_t title_cap, uint32_t* content_id);
   // Last page (current profile) whose first paragraph ID <= cid — the
-  // same monotonic search cycleSize uses, exposed for TOC jumps.
-  uint16_t pageForContentId(uint32_t cid);
+  // same monotonic search stepSize uses, exposed for TOC jumps.
+  uint16_t pageForContentId(uint32_t cid);   // paragraph-id search
+  uint16_t pageForSentenceId(uint32_t sid);  // sentence-id search
+
+  // v8: the footnote table (compiler-written "FBPN" block after the TOC:
+  // FbpNoteEnt {from_cid, to_cid} sorted by from_cid). notesOnPage answers
+  // the reader menu's "Footnotes" row: how many marks sit in paragraphs
+  // that start on this page, and where the first of them is in the table.
+  uint32_t noteCount() const { return _noteCount; }
+  bool noteEntry(uint32_t i, uint32_t* from_cid, uint32_t* to_cid);
+  uint32_t notesOnPage(uint16_t page, uint32_t* first);
+  // Notes whose mark paragraph id lies in [lo, hi] (inclusive): first
+  // index and count. The table is sorted, so the answer is contiguous.
+  uint32_t notesInCidRange(uint32_t lo, uint32_t hi, uint32_t* first);
+  // v8: the paragraph ids of the footnote MARKS drawn on the last rendered
+  // page (word boxes flagged by the compiler), distinct, in page order.
+  // This is exact where notesOnPage can only guess from page anchors: a
+  // paragraph that runs over a page break has its marks on one side.
+  uint16_t pageMarkCids(uint32_t* out, uint16_t cap);
 
   // Shelf metadata without holding the file open.
   static bool readMeta(const char* path, char* title, size_t title_cap, char* author,
@@ -84,6 +121,32 @@ class FbpBook {
   // (docs/plans/2026-08-17-buttons-and-orientation.md P6).
   uint32_t lastPeakBytes() const { return _lastPeak; }
   uint32_t lastUniqGlyphs() const { return _lastUniq; }
+
+  // v7: per-line paragraph ids of the LAST rendered page (empty for
+  // pre-v7 books). The R1 highlight cursor reads these to know which
+  // paragraph each line belongs to.
+  uint8_t lineCidCount() const { return _lineCidCount; }
+  uint32_t lineCid(uint8_t i) const { return i < _lineCidCount ? _lineCids[i] : 0; }
+  int16_t lineBaseline(uint8_t i) const { return i < _lineCidCount ? _lineBase[i] : 0; }
+
+  // v8: the word boxes of the LAST rendered page (the device's word cursor
+  // lands on them; a dictionary is asked for the text). Parsed on demand
+  // from the page buffer, which holds the inflated body until the next
+  // renderPage — copy the text out before that.
+  struct WordBox {
+    int16_t x, w;
+    uint8_t line;   // index into lineBaseline()/lineCid()
+    uint8_t flags;  // bit 0: hyphenated, continues on the next line
+    uint16_t textOff;  // into the page body
+    uint8_t textLen;
+  };
+  bool hasWordBoxes() const { return _wordTail != nullptr; }
+  // The page those boxes belong to (the last one drawn), so a caller that
+  // has already moved _fbpPage does not read another page's marks.
+  uint16_t wordBoxesPage() const { return _wordTailPage; }
+  uint16_t pageWords(WordBox* out, uint16_t cap);
+  // The word's text, NUL-terminated, into `dst`.
+  void wordText(const WordBox& w, char* dst, size_t cap) const;
 
   // Progress sidecar ("<path>.pos", 4 bytes LE page index).
   static uint16_t loadPos(const char* path, uint16_t pageCount);
@@ -167,7 +230,10 @@ class FbpBook {
   bool readAt(uint64_t off, void* dst, size_t n);
   bool readProfile(uint32_t i, ProfileDir* out);  // v3 stride is 32, v4 is 48
   bool applyProfile(int idx);  // parse this profile's atlas offsets
-  bool pageFirstCid(const ProfileDir& d, uint16_t page, uint32_t* cid);
+  bool pageAnchor(const ProfileDir& d, uint16_t page, uint8_t off, uint32_t* out);
+  bool pageFirstParaId(const ProfileDir& d, uint16_t page, uint32_t* cid);
+  bool pageFirstSentId(const ProfileDir& d, uint16_t page, uint32_t* sid);
+  uint16_t pageForAnchor(uint8_t off, uint32_t id);
   // v4: the profile's dictionary followed by room for one inflated page.
   // The dictionary sits at the FRONT and inflate writes after it, with
   // uzlib's output base pointed at the dictionary's first byte — so a
@@ -178,12 +244,22 @@ class FbpBook {
   uint32_t _dictLen = 0;
   bool inflatePage(uint64_t rec_off, uint32_t clen, uint32_t raw_len);
   uint32_t _lastPeak = 0;
+  uint64_t _noteOff = 0;    // first FbpNoteEnt, 0 when the book has no table
+  uint32_t _noteCount = 0;
+  static constexpr uint8_t kMaxPageLines = 64;
+  uint32_t _lineCids[kMaxPageLines];
+  int16_t _lineBase[kMaxPageLines];
+  uint8_t _lineCidCount = 0;
+  const uint8_t* _wordTail = nullptr;     // v8 word tail of the last page, inside _page
+  const uint8_t* _wordTailEnd = nullptr;
+  uint16_t _wordTailLines = 0;
+  uint16_t _wordTailPage = 0xFFFF;
   uint32_t _lastUniq = 0;
   void drawGlyph(Gfx& gfx, const GlyphMeta& m, const uint8_t* bits, int x, int baseline);
   void drawImage(Gfx& gfx, uint32_t idx, int x, int y, uint16_t w, uint16_t h);
 
   FsFile _f;
-  bool _open = false, _profSelected = false;
+  bool _open = false, _profSelected = false, _oom = false;
   Header _hdr;
   ProfileDir _geo[kMaxSizes];  // this geometry's profiles, ascending px
   int _nGeo = 0, _profIdx = 0;

@@ -11,13 +11,13 @@
 // LONG-PRESS CONFIRM clears the whole inbox (the OPEN tab carries the
 // long-press dot), BACK returns to the launcher.
 //
-// Header SYNC button (_sel == -1): pressing UP from the first row moves the
-// cursor onto a small SYNC pill in the header's top-right (where the old
-// "n-m" scroll range indicator lived); the CONFIRM soft-key relabels
-// OPEN -> SYNC and pressing it forces a manual ANCS resync (the automatic
-// onEnter resync sometimes lands before the link is ready — this is the
-// user-visible retry). The pill flashes inverted for ~1.2 s as feedback.
-// With an empty inbox the cursor parks on SYNC, so it is always reachable.
+// Sync (flowe-os#40, heyflorin's design): the header's top-right shows a
+// quiet freshness caption ("SYNCED 5M AGO" / "SYNCING..." / "NOT SYNCED"),
+// and the CONTROL lives in the soft-key bar — with the cursor on the first
+// row (or an empty inbox) the UP tab relabels to SYNC, and pressing it
+// forces a manual ANCS resync (the automatic onEnter resync sometimes
+// lands before the link is ready — this is the user-visible retry). The
+// button-world cousin of pull-to-refresh: at the top, "up" means refresh.
 //
 // Detail view: full app id line, word-wrapped bold title, word-wrapped
 // message (Gfx::drawTextWrapped, "..." on the last line when clipped),
@@ -53,20 +53,25 @@ class NotificationsScene : public Scene {
   // Logical rect of one on-screen row slot (0.._rowsPerPageCache-1),
   // including the selection border slop. Empty before the first render.
   XpRect rowRect(int visibleIndex) const;
-  // Logical rect of the header band (holds the SYNC pill) — repainted when
-  // the cursor crosses between the pill and row 0, or on sync feedback.
+  // Logical rect of the header band (holds the sync caption) — repainted
+  // on sync feedback and when the caption changes.
   XpRect headerRect() const;
   void moveSelection(int delta);
+  void syncNow();
   void renderList(Gfx& gfx);
   void renderDetail(Gfx& gfx, int count);
 
   View _view = View::List;
-  int _sel = 0;     // selected entry (newest-first index); -1 = header SYNC pill
+  int _sel = 0;     // selected entry (newest-first index)
   int _scroll = 0;  // first visible list row (window follows _sel)
   int _rowsPerPageCache = 1;
   int16_t _wCache = 0, _hCache = 0;  // panel dims cached by render()
-  // Sync-press feedback: pill renders inverted until this deadline (0 = idle).
-  // Expiry is polled on the input tick (handleInput), matching BlockScene's
-  // transient pattern — no timers, no BLE-path redraws.
+  // Sync-press feedback: the caption reads "SYNCING..." until this deadline
+  // (0 = idle). Expiry is polled on the input tick (handleInput), matching
+  // BlockScene's transient pattern — no timers, no BLE-path redraws.
   uint32_t _syncFlashUntilMs = 0;
+  // millis() when the last ANCS replay actually STARTED (requestResync
+  // returned true); 0 = none this power-on. Sleep is a reboot and onEnter
+  // re-syncs, so a millis clock is honest across the scene's whole life.
+  uint32_t _lastSyncMs = 0;
 };

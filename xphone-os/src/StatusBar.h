@@ -27,6 +27,26 @@ bool xphoneSyncBusy();
 
 namespace StatusBar {
 
+// The brand stamp: the half-sun on its horizon with two ripple bars, then
+// the "flowe" wordmark. Centered on cx; y is the wordmark's line top.
+// Used by the sleep faces (replaces the pre-rebrand crescent + "xphone").
+inline void drawFloweStamp(Gfx& gfx, const int cx, const int y) {
+  constexpr int kSunD = 22;
+  constexpr int kGap = 12;
+  const char* kWord = "flowe";
+  const int total = kSunD + kGap + gfx.textWidth(kFontBold, kWord);
+  const int sunX = cx - total / 2;
+  const int sunTop = y + (gfx.lineHeight(kFontBold) - kSunD) / 2;
+  const int horizonY = sunTop + kSunD / 2;
+  gfx.fillRoundedRect(sunX, sunTop, kSunD, kSunD, kSunD / 2, true);
+  gfx.fillRect(sunX - 2, horizonY, kSunD + 4, kSunD / 2 + 2, false);
+  const int sunCx = sunX + kSunD / 2;
+  gfx.fillRect(sunCx - (kSunD + 4) / 2, horizonY + 3, kSunD + 4, 2, true);
+  gfx.fillRect(sunCx - (kSunD - 8) / 2, horizonY + 8, kSunD - 8, 2, true);
+  gfx.drawText(kFontBold, sunX + kSunD + kGap, y, kWord, true);
+}
+
+
 constexpr int kBattW = 15;   // body width incl. terminal end line
 constexpr int kBattH = 12;   // body height
 constexpr int kNubW = 1;     // terminal nub column right of the body

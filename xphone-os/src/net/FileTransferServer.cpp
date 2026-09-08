@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include "FileTransferServer.h"
 
 #include "../StallWatch.h"
@@ -91,6 +92,12 @@ bool FileTransferServer::tokenOk() {
 }
 
 bool FileTransferServer::begin() {
+  if (!_upload.buffer) _upload.buffer = static_cast<uint8_t*>(malloc(UploadState::kBufferSize));
+  if (!_upload.buffer) {
+    Serial.println("[xphone-os] transfer: OOM creating the upload buffer");
+    return false;
+  }
+  _upload.bufferPos = 0;
   _server.reset(new (std::nothrow) WebServer(80));
   if (!_server) {
     Serial.println("[xphone-os] transfer: OOM creating WebServer");
@@ -132,22 +139,23 @@ bool FileTransferServer::begin() {
   });
   _server->on(
       "/upload", HTTP_POST, [this] { handleUploadDone(); }, [this] { handleUploadData(); });
-  // End-of-session from the phone. BLE is torn down for the whole Wi-Fi
-  // session (heap: the two stacks don't fit together on the X3), so "stop"
-  // must arrive over HTTP. The restart is the session teardown AND what
-  // brings BLE back.
+  // End-of-session from the phone. BLE is down for the whole Wi-Fi session,
+  // so "stop" must arrive over HTTP. Until 2026-09-04 this handler called
+  // esp_restart() directly; now it only raises stopRequested() and the
+  // scene tears Wi-Fi down and brings BLE back without a reboot.
   _server->on("/stop", HTTP_POST, [this] {
     if (!tokenOk()) {
       Serial.println("[xphone-os] transfer: stop REJECTED (token mismatch)");
       _server->send(403, "text/plain", "Missing session token");
       return;
     }
-    _server->send(200, "text/plain", "Restarting");
+    // Tell the phone how long a normal return takes, so its "handing
+    // off" state knows when to worry: Wi-Fi off ~0.1 s, BLE up ~1 s,
+    // then the phone's own reconnect (3-5 s on the bench, 2026-09-04).
+    _server->send(200, "application/json", "{\"state\":\"stopping\",\"bleBackMs\":2000}");
     _server->client().flush();
-    Serial.println("[xphone-os] transfer: stop via HTTP; restarting");
-    Serial.flush();
-    delay(150);  // let the response reach the phone
-    esp_restart();
+    Serial.println("[xphone-os] transfer: stop via HTTP");
+    _stopRequested = true;
   });
   _server->onNotFound([this] { _server->send(404, "text/plain", "Not found"); });
 
@@ -157,15 +165,42 @@ bool FileTransferServer::begin() {
   }
   _server->begin();
   _running = true;
+  _stopRequested = false;
   _bytesUploaded = 0;
   _bytesDownloaded = 0;
   _requestCount = 0;
+  // A .part left by a reset mid-upload has no owner. Sweep them at every
+  // session start so the card never carries a stub for long.
+  if (SdMan.ready() || SdMan.begin()) {
+    FsFile dir = SdMan.open("/books", O_RDONLY);
+    if (dir && dir.isDir()) {
+      FsFile f;
+      char name[160];
+      int swept = 0;
+      while (f.openNext(&dir, O_RDONLY)) {
+        const size_t n = f.getName(name, sizeof(name));
+        f.close();
+        if (n >= 5 && n < sizeof(name) && strcasecmp(name + n - 5, ".part") == 0) {
+          char path[200];
+          snprintf(path, sizeof(path), "/books/%s", name);
+          if (SdMan.remove(path)) swept++;
+        }
+      }
+      dir.close();
+      if (swept) Serial.printf("[xphone-os] transfer: swept %d stale .part file(s)\n", swept);
+    }
+  }
   Serial.printf("[xphone-os] transfer: HTTP server up, free heap %u\n", static_cast<unsigned>(ESP.getFreeHeap()));
   return true;
 }
 
 void FileTransferServer::stop() {
   if (gUploadFile) gUploadFile.close();
+  if (_upload.buffer) {
+    free(_upload.buffer);
+    _upload.buffer = nullptr;
+    _upload.bufferPos = 0;
+  }
   if (_server) {
     _server->stop();
     _server.reset();
@@ -173,8 +208,15 @@ void FileTransferServer::stop() {
   _running = false;
 }
 
+bool FileTransferServer::isolate = false;
+
 void FileTransferServer::handleClient() {
+  if (isolate) return;  // bench: a network where nobody can reach us
   if (_running && _server) _server->handleClient();
+}
+
+const char* FileTransferServer::lastUri() const {
+  return (_running && _server) ? _server->uri().c_str() : "";
 }
 
 bool FileTransferServer::queryPath(char* dst, const size_t dstSize, const bool required) {
@@ -308,18 +350,71 @@ void FileTransferServer::handleFileList() {
 
   // Streamed (chunked) response, same shape as CrossPoint handleFileListData
   // (x4-os CrossPointWebServer.cpp:440-488) so the iOS decoder is shared.
+  //
+  // One chunk per ~1.4 KB batch, written straight to the client, and the
+  // listing STOPS at the first write the client does not take. The old
+  // shape (three small writes per entry through sendContent, no check) is
+  // the freeze of 2026-09-07: a JTAG halt of a frozen X4 showed the loop in
+  // NetworkClient::write -> select for one 81-byte entry. Every write that
+  // the socket refuses burns the framework's ten 1 s retries, and the loop
+  // then moved on to the next entry and burned ten more — 62 entries, ten
+  // minutes, a device that looks dead. Now the worst case is one refused
+  // batch (about 10 s), a log line, and the connection dropped.
+  NetworkClient client = _server->client();
+  client.setNoDelay(true);  // small chunks must not wait for the peer's delayed ACK
   _server->setContentLength(CONTENT_LENGTH_UNKNOWN);
   _server->send(200, "application/json", "");
-  _server->sendContent("[");
 
+  char batch[1400];
+  size_t used = 0;
+  unsigned entries = 0;
+  bool alive = true;
+  auto flushBatch = [&]() -> bool {
+    if (used == 0) return true;
+    char frame[sizeof(batch) + 16];
+    const int head = snprintf(frame, sizeof(frame), "%x\r\n", static_cast<unsigned>(used));
+    memcpy(frame + head, batch, used);
+    memcpy(frame + head + used, "\r\n", 2);
+    const size_t total = static_cast<size_t>(head) + used + 2;
+    const size_t wrote = client.write(reinterpret_cast<const uint8_t*>(frame), total);
+    used = 0;
+    if (wrote != total) {
+      Serial.printf("[xphone-os] transfer: listing: client stopped taking bytes after %u entries (%u of %u written); dropping it\n",
+                    entries, static_cast<unsigned>(wrote), static_cast<unsigned>(total));
+      client.stop();
+      return false;
+    }
+    return true;
+  };
+  auto append = [&](const char* text, size_t len) -> bool {
+    if (used + len > sizeof(batch) && !flushBatch()) return false;
+    if (len > sizeof(batch)) return false;  // never: entries are < 256 B
+    memcpy(batch + used, text, len);
+    used += len;
+    return true;
+  };
+
+  alive = append("[", 1);
   bool first = true;
   FsFile f;
   JsonDocument doc;
   char name[128];
   char out[256];
-  while (f.openNext(&dir, O_RDONLY)) {
+  while (alive && f.openNext(&dir, O_RDONLY)) {
     const size_t got = f.getName(name, sizeof(name));
-    if (got > 0 && got < sizeof(name) && !isHiddenName(name)) {
+    // A package the card cannot read is not a book (2026-09-07): one with a
+    // bad magic on Andrew's X3 stalled the loop 21 s and cut the stream when
+    // a phone copied it, which failed the phone's whole sync as "network
+    // connection was lost". Four bytes per package to keep it off the list.
+    bool unreadable = false;
+    if (got > 0 && !f.isDir() && got > 4 && strcasecmp(name + got - 4, ".fbp") == 0) {
+      uint8_t magic[4] = {0};
+      if (f.read(magic, 4) != 4 || memcmp(magic, "FBPK", 4) != 0) {
+        unreadable = true;
+        Serial.printf("[xphone-os] transfer: listing: skipping unreadable package '%s'\n", name);
+      }
+    }
+    if (got > 0 && got < sizeof(name) && !isHiddenName(name) && !unreadable) {
       doc.clear();
       doc["name"] = name;
       doc["size"] = f.isDir() ? 0 : static_cast<uint32_t>(f.fileSize());
@@ -327,17 +422,19 @@ void FileTransferServer::handleFileList() {
       doc["isEpub"] = !f.isDir() && hasEpubExtension(name);
       const size_t written = serializeJson(doc, out, sizeof(out));
       if (written < sizeof(out)) {
-        if (!first) _server->sendContent(",");
+        if (!first) alive = append(",", 1);
         first = false;
-        _server->sendContent(out);
+        if (alive) alive = append(out, written);
+        ++entries;
       }
     }
     f.close();
     yield();
   }
   dir.close();
-  _server->sendContent("]");
-  _server->sendContent("");  // terminate chunked stream
+  if (alive) alive = append("]", 1) && flushBatch();
+  if (alive) _server->sendContent("");  // the chunked terminator, one write
+  stallwatch::stage("files: done");
 }
 
 void FileTransferServer::handleDownload() {
@@ -354,6 +451,22 @@ void FileTransferServer::handleDownload() {
     file.close();
     _server->send(400, "text/plain", "Path is a directory");
     return;
+  }
+  // A package with a bad magic stalls the loop for 21 s and cuts the stream
+  // partway (2026-09-07); refuse it in one round trip instead.
+  {
+    const size_t plen = strlen(path);
+    if (plen > 4 && strcasecmp(path + plen - 4, ".fbp") == 0) {
+      uint8_t magic[4] = {0};
+      const bool bad = file.read(magic, 4) != 4 || memcmp(magic, "FBPK", 4) != 0;
+      file.seekSet(0);
+      if (bad) {
+        file.close();
+        Serial.printf("[xphone-os] transfer: download refused, unreadable package '%s'\n", path);
+        _server->send(409, "text/plain", "Package unreadable on the card");
+        return;
+      }
+    }
   }
 
   const char* slash = strrchr(path, '/');
@@ -626,10 +739,15 @@ void FileTransferServer::handleUploadData() {
       return;
     }
     snprintf(_upload.path, sizeof(_upload.path), "%s/%s", dir, up.filename.c_str());
+    // Write to a .part file and rename only on a clean end. A reset or a
+    // dropped connection mid-upload used to leave a truncated file under the
+    // real name; the device listed it and both phones read it as the book
+    // (0-byte "PHM Cover Test.fbp" and a bad-magic Ikigai, 2026-09-06).
+    snprintf(_upload.part, sizeof(_upload.part), "%s.part", _upload.path);
 
     esp_task_wdt_reset();
-    if (SdMan.exists(_upload.path)) SdMan.remove(_upload.path);
-    gUploadFile = SdMan.open(_upload.path, O_WRONLY | O_CREAT | O_TRUNC);
+    if (SdMan.exists(_upload.part)) SdMan.remove(_upload.part);
+    gUploadFile = SdMan.open(_upload.part, O_WRONLY | O_CREAT | O_TRUNC);
     if (!gUploadFile) {
       Serial.printf("[xphone-os] transfer: create %s failed\n", _upload.path);
       _upload.failed = true;
@@ -655,11 +773,13 @@ void FileTransferServer::handleUploadData() {
         _upload.failed = true;
         gUploadFile.close();
         _upload.fileOpen = false;
+        SdMan.remove(_upload.part);
         return;
       }
     }
     _upload.received += up.currentSize;
     _bytesUploaded += up.currentSize;
+    feedLoopWDT();  // a whole book arrives inside one handleClient(); the loop watchdog must not count it as a hang
     // ~4 MB cadence: at bench speed (~165 KB/s) that is one e-ink repaint
     // every ~25 s — visible progress for ~3% throughput cost.
     if (progressHook && _bytesUploaded - _hookMark >= 4u * 1024u * 1024u) {
@@ -672,6 +792,16 @@ void FileTransferServer::handleUploadData() {
       if (!flushUploadBuffer()) _upload.failed = true;
       gUploadFile.close();
       _upload.fileOpen = false;
+    }
+    if (!_upload.failed) {
+      // Promote the .part to the real name, atomically. If a stale file is
+      // there (a replace), drop it first.
+      if (SdMan.exists(_upload.path)) SdMan.remove(_upload.path);
+      if (!SdMan.rename(_upload.part, _upload.path)) {
+        Serial.printf("[xphone-os] transfer: rename %s failed; dropping\n", _upload.part);
+        SdMan.remove(_upload.part);
+        _upload.failed = true;
+      }
     }
     if (!_upload.failed) {
       Serial.printf("[xphone-os] transfer: upload done %s (%u bytes)\n", _upload.path,
@@ -696,7 +826,7 @@ void FileTransferServer::handleUploadData() {
     if (_upload.fileOpen) {
       gUploadFile.close();
       _upload.fileOpen = false;
-      SdMan.remove(_upload.path);  // drop the partial file
+      SdMan.remove(_upload.part);  // drop the partial file
     }
     _upload.failed = true;
     Serial.println("[xphone-os] transfer: upload aborted");
@@ -757,6 +887,8 @@ static void handoffEpubPosition(const char* epubPath, const char* fbpPath) {
 }
 
 void FileTransferServer::handleUploadDone() {
+  Serial.printf("[xphone-os] transfer: upload done heap=%u largest=%u\n", ESP.getFreeHeap(),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
   _requestCount++;
   if (_upload.failed) {
     _server->send(400, "text/plain", "Upload failed");

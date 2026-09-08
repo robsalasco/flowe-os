@@ -344,6 +344,18 @@ void FreeInkDisplay::setCustomLUT(bool enabled, const unsigned char* lutData) {
   if (_driver) _driver->setCustomLut(_bus, enabled, lutData);
 }
 
+void FreeInkDisplay::setIdlePowerOff(bool on) {
+  if (_driver) _driver->setIdlePowerOff(on);
+}
+bool FreeInkDisplay::idlePowerOff() const { return _driver ? _driver->idlePowerOff() : false; }
+void FreeInkDisplay::setHalfTemp(int8_t c) {
+  if (_driver) _driver->setHalfTemp(c);
+}
+void FreeInkDisplay::setFirstRefreshFull(bool on) {
+  if (_driver) _driver->setFirstRefreshFull(on);
+}
+int8_t FreeInkDisplay::halfTemp() const { return _driver ? _driver->halfTemp() : 0x7F; }
+
 void FreeInkDisplay::deepSleep() {
   if (_driver) _driver->deepSleep(_bus);
 }

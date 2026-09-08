@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <uzlib.h>
+#include <esp_heap_caps.h>
 
 #include "../Gfx.h"
 
@@ -40,6 +41,22 @@ static inline void skipVarint(const uint8_t** p, const uint8_t* end) {
 
 namespace reader {
 
+// Bench: force the no-arena render path (devcon "arenaoff"), so the
+// never-blank fallback is provable on glass instead of waited for.
+bool gBenchNoArena = false;
+}  // namespace reader
+bool benchSetNoArena(bool on) { reader::gBenchNoArena = on; return on; }
+namespace reader {
+
+// A page that fails to render paints BLANK, and the caller's "composed"
+// line prints regardless — so every exit names itself here, with the heap
+// shape, or a field report of blank pages has nothing to go on.
+static void pageFail(const char* what, uint16_t page, size_t need) {
+  Serial.printf("[xphone-os] fbp: page %u NOT rendered: %s (need=%u heap=%u largest=%u)\n",
+                static_cast<unsigned>(page + 1), what, static_cast<unsigned>(need), ESP.getFreeHeap(),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+}
+
 bool FbpBook::readAt(uint64_t off, void* dst, size_t n) {
   if (!_f.seekSet(off)) return false;
   return _f.read(dst, n) == (int)n;
@@ -72,8 +89,98 @@ bool FbpBook::open(const char* path) {
     dsts[i][take] = 0;
     mo += 2 + len;
   }
+  // v8: the footnote table follows the TOC entries. Older files put the
+  // shelf there, so the version gate matters as much as the tag.
+  _noteOff = 0;
+  _noteCount = 0;
+  if (_hdr.fmt_ver >= 8) {
+    const uint64_t off = _hdr.toc_off + (uint64_t)_hdr.toc_count * 52;
+    char tag[4];
+    uint32_t n = 0;
+    if (readAt(off, tag, 4) && memcmp(tag, "FBPN", 4) == 0 && readAt(off + 4, &n, 4)) {
+      _noteOff = off + 8;
+      _noteCount = n;
+    }
+  }
   _open = true;
   return true;
+}
+
+bool FbpBook::noteEntry(uint32_t i, uint32_t* from_cid, uint32_t* to_cid) {
+  if (!_noteOff || i >= _noteCount) return false;
+  uint32_t e[2];
+  if (!readAt(_noteOff + (uint64_t)i * 8, e, 8)) return false;
+  if (from_cid) *from_cid = e[0];
+  if (to_cid) *to_cid = e[1];
+  return true;
+}
+
+// Marks on `page`: notes whose from_cid lies in [first paragraph of this
+// page, first paragraph of the next page). A paragraph that runs over the
+// page break belongs to the page it started on. Binary search on from_cid;
+// the table is sorted by the compiler.
+uint32_t FbpBook::notesInCidRange(uint32_t lo, uint32_t hi, uint32_t* first) {
+  if (first) *first = 0;
+  if (!_noteOff || !_noteCount || hi < lo) return 0;
+  // First note with from_cid >= lo.
+  uint32_t a = 0, b = _noteCount;
+  while (a < b) {
+    const uint32_t mid = (a + b) / 2;
+    uint32_t f = 0;
+    if (!noteEntry(mid, &f, nullptr)) return 0;
+    if (f < lo) a = mid + 1; else b = mid;
+  }
+  uint32_t n = 0;
+  for (uint32_t i = a; i < _noteCount; i++) {
+    uint32_t f = 0;
+    if (!noteEntry(i, &f, nullptr) || f > hi) break;
+    n++;
+  }
+  if (first) *first = a;
+  return n;
+}
+
+// The page-anchor guess: notes of paragraphs whose id falls between this
+// page's first paragraph and the next page's. A paragraph that runs over
+// the break is counted where it ENDS (the next page's anchor is that
+// paragraph). pageMarkCids is exact; this is the fallback for a page the
+// reader has not drawn yet or a book without word boxes.
+uint32_t FbpBook::notesOnPage(uint16_t page, uint32_t* first) {
+  if (first) *first = 0;
+  if (!_noteOff || !_noteCount || !_profSelected) return 0;
+  const ProfileDir& d = _geo[_profIdx];
+  uint32_t lo = 0, hi = 0xFFFFFFFFu;
+  if (!pageFirstParaId(d, page, &lo)) return 0;
+  if ((uint32_t)page + 1 < d.page_count && !pageFirstParaId(d, (uint16_t)(page + 1), &hi)) return 0;
+  if (hi <= lo) hi = lo + 1;  // a page that starts inside the same paragraph as the next
+  return notesInCidRange(lo, hi - 1, first);
+}
+
+uint16_t FbpBook::pageMarkCids(uint32_t* out, uint16_t cap) {
+  if (!_wordTail || !out || !cap) return 0;
+  const uint8_t* p = _wordTail;
+  const uint8_t* end = _wordTailEnd;
+  uint16_t n = 0;
+  for (uint16_t l = 0; l < _wordTailLines && p < end; l++) {
+    const int32_t count = readVarint(&p, end);
+    for (int32_t w = 0; w < count && p + 2 <= end; w++) {
+      readVarint(&p, end);  // x0 delta
+      readVarint(&p, end);  // width
+      if (p + 2 > end) return n;
+      const uint8_t flags = *p++;
+      const uint8_t tl = *p++;
+      if (p + tl > end) return n;
+      p += tl;
+      if ((flags & 2) && l < _lineCidCount) {
+        const uint32_t cid = _lineCids[l];
+        bool seen = false;
+        for (uint16_t i = 0; i < n; i++)
+          if (out[i] == cid) { seen = true; break; }
+        if (!seen && n < cap) out[n++] = cid;
+      }
+    }
+  }
+  return n;
 }
 
 // One profile directory, whatever the file's version. v3 entries are 32
@@ -98,6 +205,7 @@ bool FbpBook::readProfile(uint32_t i, ProfileDir* out) {
 
 bool FbpBook::selectProfile(uint16_t w, uint16_t h, uint16_t prefer_px) {
   _nGeo = 0;
+  _oom = false;
   for (uint32_t i = 0; i < _hdr.profile_count && _nGeo < kMaxSizes; i++) {
     ProfileDir d;
     if (!readProfile(i, &d)) return false;
@@ -109,11 +217,28 @@ bool FbpBook::selectProfile(uint16_t w, uint16_t h, uint16_t prefer_px) {
     if (!readProfile(0, &_geo[0])) return false;
     _nGeo = 1;
   }
+  // Nearest px to the preference, not exact-match: the preference may come
+  // from a book in another size family (apps compile 22/26/30, the Press
+  // 14/18/22), and "closest to what you chose" beats silently ignoring it.
   int pick = _nGeo / 2;
-  if (prefer_px)
-    for (int i = 0; i < _nGeo; i++)
-      if (_geo[i].px_size == prefer_px) pick = i;
-  if (!applyProfile(pick)) return false;
+  if (prefer_px) {
+    int best = 1 << 20;
+    for (int i = 0; i < _nGeo; i++) {
+      const int d = _geo[i].px_size > prefer_px ? _geo[i].px_size - prefer_px
+                                                : prefer_px - _geo[i].px_size;
+      if (d < best) {
+        best = d;
+        pick = i;
+      }
+    }
+  }
+  // A profile whose page buffer cannot allocate right now must not refuse
+  // the whole book: try the others before giving up.
+  bool applied = applyProfile(pick);
+  for (int i = 0; !applied && i < _nGeo; i++) {
+    if (i != pick) applied = applyProfile(i);
+  }
+  if (!applied) return false;
   _profSelected = true;
   Serial.printf("[xphone-os] fbp: %d sizes @%ux%u, using %upx pages=%u fonts=%u\n", _nGeo, w, h,
                 pxSize(), pageCount(), _nfonts);
@@ -137,7 +262,7 @@ bool FbpBook::applyProfile(int idx) {
   }
 
   // v4: claim the page buffer for THIS profile and load its dictionary.
-  // cycleSize calls back in here to change size, so the old buffer goes
+  // stepSize calls back in here to change size, so the old buffer goes
   // first — the two profiles have different dictionaries.
   free(_page);
   _page = nullptr;
@@ -154,6 +279,7 @@ bool FbpBook::applyProfile(int idx) {
     if (!_page) {
       Serial.printf("[xphone-os] fbp: no room for a %lu byte page buffer (heap=%u)\n",
                     (unsigned long)cap, ESP.getFreeHeap());
+      _oom = true;
       return false;
     }
     if (d.dict_size && !readAt(d.dict_off, _page, d.dict_size)) {
@@ -228,7 +354,12 @@ bool FbpBook::selectProfileFresh(const uint16_t w, const uint16_t h) {
 
 bool FbpBook::pageFirstCidPublic(const uint16_t page, uint32_t* cid) {
   if (!_profSelected) return false;
-  return pageFirstCid(_geo[_profIdx], page, cid);
+  return pageFirstParaId(_geo[_profIdx], page, cid);
+}
+
+bool FbpBook::pageFirstSidPublic(const uint16_t page, uint32_t* sid) {
+  if (!_profSelected) return false;
+  return pageFirstSentId(_geo[_profIdx], page, sid);
 }
 
 // Reader menu "Chapters": one TOC record. The title field is fixed-width
@@ -247,17 +378,16 @@ bool FbpBook::tocEntry(uint32_t i, char* title, size_t title_cap, uint32_t* cont
   return true;
 }
 
-// Last page whose first paragraph ID <= cid (IDs are monotonic across
-// pages by construction). Same search cycleSize does, on the CURRENT
-// profile — TOC jumps land on the chapter's opening page.
-uint16_t FbpBook::pageForContentId(uint32_t cid) {
+// Last page whose anchor of the given kind is <= id (both counters are
+// monotonic across pages by construction).
+uint16_t FbpBook::pageForAnchor(const uint8_t off, const uint32_t id) {
   const ProfileDir& d = _geo[_profIdx];
   uint32_t lo = 0, hi = d.page_count ? d.page_count - 1 : 0, best = 0;
   while (lo <= hi) {
     uint32_t mid = (lo + hi) / 2;
     uint32_t mc = 0;
-    if (!pageFirstCid(d, (uint16_t)mid, &mc)) break;
-    if (mc <= cid) {
+    if (!pageAnchor(d, (uint16_t)mid, off, &mc)) break;
+    if (mc <= id) {
       best = mid;
       if (mid == hi) break;
       lo = mid + 1;
@@ -269,35 +399,58 @@ uint16_t FbpBook::pageForContentId(uint32_t cid) {
   return (uint16_t)best;
 }
 
-// v3: the fine anchor is the page's first SENTENCE ID (second u32 of the
-// record header). SIZE search on it lands near line-exact.
-bool FbpBook::pageFirstCid(const ProfileDir& d, uint16_t page, uint32_t* cid) {
+// TOC jumps, bookmarks and goto speak PARAGRAPH content ids (rec+0).
+uint16_t FbpBook::pageForContentId(uint32_t cid) { return pageForAnchor(0, cid); }
+// Size/orientation carries speak the finer SENTENCE ids (rec+4).
+uint16_t FbpBook::pageForSentenceId(uint32_t sid) { return pageForAnchor(4, sid); }
+
+// The record header's two anchors (identical layout in v3 and v4):
+// rec+0 = first PARAGRAPH content id, rec+4 = first SENTENCE id. Sentence
+// ids grow faster. The old single accessor read rec+4 while several
+// callers passed paragraph ids — the lands-early chapter-jump bug.
+bool FbpBook::pageAnchor(const ProfileDir& d, uint16_t page, uint8_t off, uint32_t* out) {
   uint64_t rec = 0;
   if (!readAt(d.page_index_off + (uint64_t)page * 8, &rec, 8)) return false;
-  return readAt(rec + 4, cid, 4);
+  return readAt(rec + off, out, 4);
+}
+bool FbpBook::pageFirstParaId(const ProfileDir& d, uint16_t page, uint32_t* cid) {
+  return pageAnchor(d, page, 0, cid);
+}
+bool FbpBook::pageFirstSentId(const ProfileDir& d, uint16_t page, uint32_t* sid) {
+  return pageAnchor(d, page, 4, sid);
 }
 
 // Pages inside a long paragraph all share its content ID, so the run of
 // same-ID pages measures how deep into the paragraph a page is; expanding
 // a run costs a handful of 12-byte reads (runs are short).
-bool FbpBook::cycleSize(uint16_t cur_page, uint16_t* new_page) {
+bool FbpBook::stepSize(int dir, uint16_t cur_page, uint16_t* new_page) {
   if (_nGeo <= 1) return false;
+  const int target = (_profIdx + (dir > 0 ? 1 : _nGeo - 1)) % _nGeo;
   uint32_t cid = 0;
-  if (!pageFirstCid(_geo[_profIdx], cur_page, &cid)) return false;
+  if (!pageFirstSentId(_geo[_profIdx], cur_page, &cid)) return false;
 
   // Depth within the current paragraph: page k of n sharing this ID.
   uint32_t old_start = cur_page, old_len = 1;
   {
     const ProfileDir& od = _geo[_profIdx];
     uint32_t c;
-    while (old_start > 0 && pageFirstCid(od, (uint16_t)(old_start - 1), &c) && c == cid) old_start--;
+    while (old_start > 0 && pageFirstSentId(od, (uint16_t)(old_start - 1), &c) && c == cid) old_start--;
     uint32_t e = cur_page;
-    while (e + 1 < od.page_count && pageFirstCid(od, (uint16_t)(e + 1), &c) && c == cid) e++;
+    while (e + 1 < od.page_count && pageFirstSentId(od, (uint16_t)(e + 1), &c) && c == cid) e++;
     old_len = e - old_start + 1;
   }
   const uint32_t k = cur_page - old_start;
 
-  if (!applyProfile((_profIdx + 1) % _nGeo)) return false;
+  if (!applyProfile(target)) {
+    // The target's page buffer would not fit (a small size packs the most
+    // glyphs per page — a 14 px buffer can top 16 KB against a fragmented
+    // reading heap; seen on the bench X4 with a Press book). The failed
+    // attempt already freed OUR buffer, so re-apply the current profile —
+    // its allocation just came back to the heap — and report failure with
+    // the book still readable. Never a blank page.
+    applyProfile(_profIdx);
+    return false;
+  }
 
   // Last page whose first content ID is <= cid (monotonic by construction).
   const ProfileDir& d = _geo[_profIdx];
@@ -305,7 +458,7 @@ bool FbpBook::cycleSize(uint16_t cur_page, uint16_t* new_page) {
   while (lo <= hi) {
     uint32_t mid = (lo + hi) / 2;
     uint32_t mc = 0;
-    if (!pageFirstCid(d, (uint16_t)mid, &mc)) break;
+    if (!pageFirstSentId(d, (uint16_t)mid, &mc)) break;
     if (mc <= cid) {
       best = mid;
       if (mid == hi) break;
@@ -320,10 +473,10 @@ bool FbpBook::cycleSize(uint16_t cur_page, uint16_t* new_page) {
   // long-paragraph (classical Arabic) case where paragraph-start landing
   // felt like losing the place.
   uint32_t c;
-  if (old_len > 1 && pageFirstCid(d, (uint16_t)best, &c) && c == cid) {
+  if (old_len > 1 && pageFirstSentId(d, (uint16_t)best, &c) && c == cid) {
     uint32_t new_start = best, e2 = best;
-    while (new_start > 0 && pageFirstCid(d, (uint16_t)(new_start - 1), &c) && c == cid) new_start--;
-    while (e2 + 1 < d.page_count && pageFirstCid(d, (uint16_t)(e2 + 1), &c) && c == cid) e2++;
+    while (new_start > 0 && pageFirstSentId(d, (uint16_t)(new_start - 1), &c) && c == cid) new_start--;
+    while (e2 + 1 < d.page_count && pageFirstSentId(d, (uint16_t)(e2 + 1), &c) && c == cid) e2++;
     uint32_t new_len = e2 - new_start + 1;
     uint32_t depth = (k * new_len + old_len / 2) / old_len;
     if (depth >= new_len) depth = new_len - 1;
@@ -389,16 +542,17 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
   if (v4) {
     // u32 first_cid, u32 first_sid, u32 raw_len, then the deflate stream.
     uint32_t raw_len = 0;
-    if (!readAt(rec_off + 8, &raw_len, 4)) return false;
-    if (!inflatePage(rec_off + 12, rec_size - 12, raw_len)) return false;
+    if (!readAt(rec_off + 8, &raw_len, 4)) { pageFail("record header read", page, 4); return false; }
+    if (!inflatePage(rec_off + 12, rec_size - 12, raw_len)) { pageFail("inflate", page, raw_len); return false; }
     body = _page + _dictLen;
     body_end = body + raw_len;
   } else {
     // ONE read for the whole page record.
     owned = (uint8_t*)malloc(rec_size);
-    if (!owned) return false;
+    if (!owned) { pageFail("record buffer", page, rec_size); return false; }
     if (!readAt(rec_off, owned, rec_size)) {
       free(owned);
+      pageFail("record read", page, rec_size);
       return false;
     }
     body = owned + 8;  // past first_cid + first_sid
@@ -417,12 +571,19 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
   //
   // Scan A: a transient key-set (8 KB) counts the uniques. It is freed
   // before the arena exists, so it never adds to the render peak.
-  const uint32_t kHash = 2048;
-  uint32_t* keyset = (uint32_t*)malloc(kHash * sizeof(uint32_t));
-  if (!keyset) {
-    free(owned);
-    return false;
-  }
+  // 1024 slots, not 2048: the key-set was the single biggest contiguous
+  // block a page needed (8 KB) and it decided blank pages on a fragmented
+  // reading heap (field report 2026-09-02: largest free block 9.2 KB with
+  // page peaks of 9.1 KB). 1024 still holds the 768-glyph worst case.
+  const uint32_t kHash = 1024;
+  // STATIC, not heap: these two tables were the fixed contiguous blocks a
+  // page could fail to get on a fragmented reading heap (blank pages,
+  // 2026-09-02). 6 KB of BSS that exists from boot cannot be refused and
+  // cannot be fragmented. The page-sized tables (uniq/order/arena) stay on
+  // the heap: they are small for Latin pages and the arena has a fallback.
+  static uint32_t sKeyset[1024];
+  static uint16_t sHmap[1024];
+  uint32_t* keyset = sKeyset;
   memset(keyset, 0xFF, kHash * sizeof(uint32_t));  // key high bits <= 5: 0xFFFFFFFF is free
   uint32_t nuniq = 0;
   const uint8_t* p = body;
@@ -455,12 +616,10 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
   // Right-sized tables: exactly this page's uniques, plus the 4 KB index map
   // the draw pass probes.
   PageGlyph* uniq = (PageGlyph*)malloc((nuniq ? nuniq : 1) * sizeof(PageGlyph));
-  uint16_t* hmap = (uint16_t*)malloc(kHash * sizeof(uint16_t));
-  if (!uniq || !hmap) {
-    free(uniq);
-    free(hmap);
-    free(keyset);
+  uint16_t* hmap = sHmap;
+  if (!uniq) {
     free(owned);
+    pageFail("glyph table", page, nuniq * sizeof(PageGlyph));
     return false;
   }
   memset(hmap, 0xFF, kHash * sizeof(uint16_t));
@@ -473,7 +632,6 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
     while (hmap[h] != 0xFFFF) h = (h + 1) & (kHash - 1);
     hmap[h] = (uint16_t)filled++;
   }
-  free(keyset);
 
   // Pass 2: metas in ascending index order per font (metas are contiguous —
   // ascending reads share sectors), recording each glyph's bits size.
@@ -481,7 +639,6 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
   FbpBook_PageGlyphSort* order =
       (FbpBook_PageGlyphSort*)malloc(nuniq * sizeof(FbpBook_PageGlyphSort));
   if (!order) {
-    free(hmap);
     free(uniq);
     free(owned);
     return false;
@@ -522,35 +679,41 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
   // the sort index and the arena.
   // Two candidate peaks now: scan A (record + the 8 KB key-set) and the
   // render proper (record + index map + right-sized uniq + sort + arena).
-  const uint32_t scanPeak = rec_size + kHash * (uint32_t)sizeof(uint32_t);
-  const uint32_t renderPeak = rec_size + kHash * (uint32_t)sizeof(uint16_t) +
-                              nuniq * (uint32_t)sizeof(PageGlyph) +
+  // HEAP peak only: the key-set and index map are static now (2026-09-02)
+  // and no longer count — the number must say what a page can fail to get.
+  const uint32_t scanPeak = rec_size;
+  const uint32_t renderPeak = rec_size + nuniq * (uint32_t)sizeof(PageGlyph) +
                               nuniq * (uint32_t)sizeof(FbpBook_PageGlyphSort) + arena_need;
   const uint32_t peak = renderPeak > scanPeak ? renderPeak : scanPeak;
   _lastPeak = peak;
   _lastUniq = nuniq;
 
   // Pass 3: bitmap bits in ascending disk order (elevator), one arena.
-  uint8_t* arena = (uint8_t*)malloc(arena_need ? arena_need : 1);
+  // The arena is an OPTIMIZATION, not a requirement. When the reading heap
+  // is too fragmented to hold it, the page is drawn anyway: pass 4 reads
+  // each glyph's bits from the card on demand into a static buffer. Slower
+  // (one read per glyph occurrence, ~200 ms a page) — but a slow page beats
+  // a blank one that stays blank (field report 2026-09-02).
+  uint8_t* arena = gBenchNoArena ? nullptr : (uint8_t*)malloc(arena_need ? arena_need : 1);
   if (!arena) {
-    free(order);
-    free(hmap);
-    free(uniq);
-    free(owned);
-    return false;
+    Serial.printf("[xphone-os] fbp: page %u degraded: no %lu byte arena (largest=%u); glyphs read per use\n",
+                  static_cast<unsigned>(page + 1), static_cast<unsigned long>(arena_need),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+  } else {
+    for (uint32_t i = 0; i < nuniq; i++)
+      order[i] = (FbpBook_PageGlyphSort){uniq[i].key, uniq[i].meta.bits_off, i};
+    qsort(order, nuniq, sizeof(order[0]), cmpGlyphOffset);
+    for (uint32_t o = 0; o < nuniq; o++) {
+      PageGlyph* g = &uniq[order[o].uniq_idx];
+      if (!g->meta.w || !g->meta.h) continue;
+      uint8_t font = (uint8_t)((g->key >> 16) - 1);
+      uint32_t rowbytes = ((uint32_t)g->meta.w + 7) / 8;
+      uint32_t need = rowbytes * g->meta.h;
+      if (!readAt(_fontBlobOff[font] + g->meta.bits_off, arena + g->arena_off, need))
+        g->meta.w = g->meta.h = 0;
+    }
   }
-  for (uint32_t i = 0; i < nuniq; i++)
-    order[i] = (FbpBook_PageGlyphSort){uniq[i].key, uniq[i].meta.bits_off, i};
-  qsort(order, nuniq, sizeof(order[0]), cmpGlyphOffset);
-  for (uint32_t o = 0; o < nuniq; o++) {
-    PageGlyph* g = &uniq[order[o].uniq_idx];
-    if (!g->meta.w || !g->meta.h) continue;
-    uint8_t font = (uint8_t)((g->key >> 16) - 1);
-    uint32_t rowbytes = ((uint32_t)g->meta.w + 7) / 8;
-    uint32_t need = rowbytes * g->meta.h;
-    if (!readAt(_fontBlobOff[font] + g->meta.bits_off, arena + g->arena_off, need))
-      g->meta.w = g->meta.h = 0;
-  }
+  static uint8_t sGlyphScratch[kMaxGlyphBits];  // the no-arena path's one glyph
 
   // Pass 4: draw everything from RAM.
   p = body;
@@ -560,6 +723,7 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
     memcpy(&baseline, p, 2);
     memcpy(&count, p + 2, 2);
     p += 4;
+    if (l < kMaxPageLines) _lineBase[l] = baseline;  // R1: retained for the highlight box
     int32_t x = 0;  // v4: x accumulates along the line and resets on each one
     for (uint16_t g = 0; g < count && p + 3 <= rec_end; g++) {
       uint32_t key = ((uint32_t)(p[0] + 1) << 16);
@@ -580,8 +744,16 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
       while (hmap[h] != 0xFFFF && uniq[hmap[h]].key != key) h = (h + 1) & (kHash - 1);
       if (hmap[h] == 0xFFFF) continue;
       PageGlyph* pg = &uniq[hmap[h]];
-      if (pg->meta.w && pg->meta.h)
-        drawGlyph(gfx, pg->meta, arena + pg->arena_off, (int)x, baseline);
+      if (pg->meta.w && pg->meta.h) {
+        if (arena) {
+          drawGlyph(gfx, pg->meta, arena + pg->arena_off, (int)x, baseline);
+        } else {
+          const uint8_t font = (uint8_t)((pg->key >> 16) - 1);
+          const uint32_t need = (((uint32_t)pg->meta.w + 7) / 8) * pg->meta.h;
+          if (readAt(_fontBlobOff[font] + pg->meta.bits_off, sGlyphScratch, need))
+            drawGlyph(gfx, pg->meta, sGlyphScratch, (int)x, baseline);
+        }
+      }
     }
   }
   for (uint16_t im = 0; im < nimgs && p + 12 <= rec_end; im++, p += 12) {
@@ -596,12 +768,80 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
     drawImage(gfx, idx, x, y, w, h);
   }
 
+  // v7 tail: one zigzag varint per line — the delta of that line's
+  // paragraph content id from the previous line's, seeded by the page's
+  // first_cid. This is what lets a highlight cursor know which paragraph
+  // each LINE belongs to. Absent (pre-v7 book) => count 0 and the R1 UI
+  // says "sync this book again".
+  _lineCidCount = 0;
+  _wordTail = nullptr;
+  if (_hdr.fmt_ver >= 7) {
+    uint32_t firstCid = 0;
+    if (pageFirstParaId(_geo[_profIdx], page, &firstCid)) {
+      uint32_t cid = firstCid;
+      uint16_t l = 0;
+      for (; l < nlines && p < rec_end && _lineCidCount < kMaxPageLines; l++) {
+        cid = (uint32_t)((int32_t)cid + readVarint(&p, rec_end));
+        _lineCids[_lineCidCount++] = cid;
+      }
+      // v8 word tail follows, and only lives on while the body sits in
+      // the page buffer (v4+ books; a v3 record buffer is freed below).
+      if (_hdr.fmt_ver >= 8 && l == nlines && !owned && p < rec_end) {
+        _wordTail = p;
+        _wordTailEnd = rec_end;
+        _wordTailLines = nlines;
+        _wordTailPage = page;
+      }
+    }
+  }
+
   free(arena);
   free(order);
-  free(hmap);
   free(uniq);
   free(owned);
   return true;
+}
+
+uint16_t FbpBook::pageWords(WordBox* out, uint16_t cap) {
+  if (!_wordTail || !out || !cap) return 0;
+  const uint8_t* p = _wordTail;
+  const uint8_t* end = _wordTailEnd;
+  const uint8_t* body = _page + _dictLen;
+  uint16_t n = 0;
+  for (uint16_t l = 0; l < _wordTailLines && p < end; l++) {
+    const int32_t count = readVarint(&p, end);
+    int32_t prev = 0;
+    for (int32_t w = 0; w < count && p + 2 <= end; w++) {
+      const int32_t x0 = prev + readVarint(&p, end);
+      const int32_t width = readVarint(&p, end);
+      if (p + 2 > end) return n;
+      const uint8_t flags = *p++;
+      const uint8_t tl = *p++;
+      if (p + tl > end) return n;
+      if (n < cap && l < kMaxPageLines) {
+        out[n].x = (int16_t)x0;
+        out[n].w = (int16_t)width;
+        out[n].line = (uint8_t)l;
+        out[n].flags = flags;
+        out[n].textOff = (uint16_t)(p - body);
+        out[n].textLen = tl;
+        n++;
+      }
+      p += tl;
+      prev = x0 + width;
+    }
+  }
+  return n;
+}
+
+void FbpBook::wordText(const WordBox& w, char* dst, size_t cap) const {
+  if (!dst || !cap) return;
+  dst[0] = 0;
+  if (!_wordTail || !_page) return;
+  const uint8_t* src = _page + _dictLen + w.textOff;
+  size_t take = w.textLen < cap - 1 ? w.textLen : cap - 1;
+  memcpy(dst, src, take);
+  dst[take] = 0;
 }
 
 bool FbpBook::readMeta(const char* path, char* title, size_t title_cap, char* author,
@@ -643,7 +883,9 @@ bool FbpBook::ensureShelfSidecars(const char* path, bool* has_cover, bool* has_s
   snprintf(str, sizeof(str), "%s.str", path);
   *has_cover = SdMan.exists(cov);
   *has_strip = SdMan.exists(str);
-  if (*has_cover || *has_strip) return true;  // extracted on a previous scan
+  // BOTH, not either: a book that ever got one sidecar but not the other
+  // (interrupted transfer, full card) used to be stuck that way forever.
+  if (*has_cover && *has_strip) return true;  // extracted on a previous scan
 
   FbpBook b;
   if (!b.open(path) || !b._hdr.shelf_off) return false;
@@ -658,11 +900,11 @@ bool FbpBook::ensureShelfSidecars(const char* path, bool* has_cover, bool* has_s
   memcpy(&sh, shdr + 10, 2);
   memcpy(&ss, shdr + 12, 4);
   uint64_t bits = b._hdr.shelf_off + 16;
-  if (ts) {
+  if (ts && !*has_cover) {
     b._f.seekSet(bits);
     *has_cover = writeXtBin(cov, tw, th, b._f, ts);
   }
-  if (ss) {
+  if (ss && !*has_strip) {
     b._f.seekSet(bits + ts);
     *has_strip = writeXtBin(str, sw, sh, b._f, ss);
   }
@@ -761,6 +1003,10 @@ void FbpBook::close() {
   free(_page);  // the dictionary + page buffer lives only while a book is open
   _page = nullptr;
   _pageCap = _dictLen = 0;
+  _noteOff = 0;
+  _noteCount = 0;
+  _wordTail = nullptr;
+  _lineCidCount = 0;
 }
 
 }  // namespace reader

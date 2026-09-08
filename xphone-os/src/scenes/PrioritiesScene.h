@@ -43,7 +43,11 @@ class PrioritiesScene : public Scene {
   // stamp into the (already cleared) framebuffer. Returns false when the
   // priorities store is empty — the caller keeps the plain wordmark sleep
   // screen. Never flushes; Sleep.cpp owns the FULL refresh.
-  static bool renderDormant(Gfx& gfx);
+  /// `napping`: the light rest (Bluetooth on, a press wakes at once) versus
+  /// off. The wake hint at the foot names the state and draws a crescent
+  /// (nap) or a full disc (off).
+  static bool renderDormant(Gfx& gfx, bool napping = false);
+  static void renderDormantWakeHint(Gfx& gfx, bool napping);
 
   // M5 sleep-frame chrome, shared with Sleep.cpp's plain wordmark screen so
   // both sleep faces read as one design. Both are centered one-liners drawn at

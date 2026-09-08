@@ -38,8 +38,14 @@ bool lastJoinedSsid(char* out, size_t outSize);
 // ---- session truth for the app ----
 void saveSeen(const char* newlineJoinedSsids);     // last scan result (names only)
 size_t loadSeen(char* out, size_t outSize);
+// Richer scan record (2026-09-04, roadmap F4): one line per network,
+// "ssid\trssi\tauth\tchannel", strongest first, up to ~8 networks. Feeds
+// the phone's picker ("seen nearby, strong") and the device Wi-Fi screen.
+void saveScan(const char* lines);
+size_t loadScan(char* out, size_t outSize);
 void saveFailure(const char* ssid, int reason80211);
 bool takeFailure(char* ssid, size_t ssidSize, int* reason);  // read + clear
+bool peekFailure(char* ssid, size_t ssidSize, int* reason);  // read only (the device Wi-Fi screen)
 
 // ---- W2 Direct mode: the device's own hotspot identity ----
 // Minted once per device (stable SSID suffix from the AP MAC, random

@@ -18,12 +18,15 @@
 
 #include "BlockStatusStore.h"
 #include "Fonts.h"
+#include "StatusBar.h"
+#include "scenes/HomeScene.h"
 #include "NotificationStore.h"
 #include "Gfx.h"
 #include "Input.h"
 #include "PrioritiesStore.h"
 #include "Scene.h"
 #include "TodayStore.h"
+#include "CpuBoost.h"
 #include "ble/CompanionBleService.h"
 #include "scenes/AppScenes.h"
 #include "scenes/PrioritiesScene.h"
@@ -58,6 +61,7 @@ constexpr const char* kBlkEndsKey = "blkEnds";
 constexpr const char* kBlkTodayKey = "blkToday";
 constexpr const char* kBlkStreakKey = "blkStreak";
 constexpr const char* kBlkTotalKey = "blkTotal";
+constexpr const char* kBlkMinKey = "blkMin";  // minutes blocked today (flowe-os#20)
 // Last Today / Priorities card JSON — re-seeded on wake so those scenes show
 // cached data (with a "syncing" indicator) instead of a blank screen.
 constexpr const char* kTodayCardKey = "todayCard";
@@ -91,21 +95,43 @@ uint8_t gTombScratch[NotificationStore::TOMBSTONE_CAPACITY * sizeof(Notification
 // model: the panel controller is always powered while awake (no idle-sleep
 // middle state), so no wake/re-init is needed before drawing.
 // ---------------------------------------------------------------------------
-void drawSleepScreen(Gfx& gfx) {
+// FNV-1a over the whole frame: the "did the poster change" test for the live
+// nap poster. 48 KB at the boosted clock is well under a millisecond.
+uint32_t frameFingerprint(Gfx& gfx) {
+  const uint8_t* b = gfx.display().getFrameBuffer();
+  const uint32_t n = gfx.display().getBufferSize();
+  uint32_t h = 2166136261u;
+  for (uint32_t i = 0; i < n; i++) h = (h ^ b[i]) * 16777619u;
+  return h;
+}
+uint32_t gLastPosterFingerprint = 0;  // the poster on the glass, 0 = none
+
+void composeSleepScreen(Gfx& gfx, const bool napping) {
   gfx.clear();
 
   // Sleeping FROM the Workout scene: the workout list replaces the priorities
   // list; the footer stack (calendar + block + wake hint) stays identical so
   // all sleep faces read as one design.
-  if (gCurrentSceneId == SceneId::Workout && WorkoutScene::renderDormant(gfx)) {
+  // "Last screen" face (home-apps, 2026-08-29; behind Settings > Sleep >
+  // Sleep screen since the 2026-09-06 merge): the frozen home hero. Needs
+  // the Widget home; the Priorities hero falls through to the poster below,
+  // which is that hero. Same footer and the same moon-and-state line as the
+  // other faces, so every rest screen reads as one design.
+  if (Sleep::face() == Sleep::Face::LastScreen && gCurrentSceneId != SceneId::Workout &&
+      homeLayout() == HomeLayout::Widget && homeRenderDormant(gfx)) {
     int slotY = gfx.height() - 108;
     if (PrioritiesScene::renderDormantBlockLine(gfx, slotY)) slotY = gfx.height() - 148;
     PrioritiesScene::renderDormantFooter(gfx, slotY);
-    gfx.drawTextCentered(kFontSmall, gfx.width() / 2, gfx.height() - 56, "press power to wake");
-  } else if (!PrioritiesScene::renderDormant(gfx)) {
+    PrioritiesScene::renderDormantWakeHint(gfx, napping);
+  } else if (gCurrentSceneId == SceneId::Workout && WorkoutScene::renderDormant(gfx)) {
+    int slotY = gfx.height() - 108;
+    if (PrioritiesScene::renderDormantBlockLine(gfx, slotY)) slotY = gfx.height() - 148;
+    PrioritiesScene::renderDormantFooter(gfx, slotY);
+    PrioritiesScene::renderDormantWakeHint(gfx, napping);
+  } else if (!PrioritiesScene::renderDormant(gfx, napping)) {
     const int cx = gfx.width() / 2;
     const int wordmarkY = gfx.height() * 2 / 5;
-    gfx.drawTextCentered(kFontBold, cx, wordmarkY, "xphone");
+    StatusBar::drawFloweStamp(gfx, cx, wordmarkY);
 
     // Short 2px rule under the wordmark (same rule style as AboutScene).
     constexpr int kRuleW = 56;
@@ -120,7 +146,7 @@ void drawSleepScreen(Gfx& gfx) {
     if (PrioritiesScene::renderDormantBlockLine(gfx, slotY)) slotY = gfx.height() - 148;
     PrioritiesScene::renderDormantFooter(gfx, slotY);
 
-    gfx.drawTextCentered(kFontSmall, cx, gfx.height() - 56, "press power to wake");
+    PrioritiesScene::renderDormantWakeHint(gfx, napping);
   }
   // Ghost scrub: auto-sleep fires after minutes of an unchanged, differential-
   // refreshed image, and one FULL inversion pass can leave a faint imprint of
@@ -128,8 +154,34 @@ void drawSleepScreen(Gfx& gfx) {
   // same reason (Uc8253X3Driver::begin, _initialFullSyncsRemaining = 2), so
   // mirror it here: requestResync(1) makes this FULL run as a forced full sync
   // plus one post-condition pass with the OEM _normal bank. No-op on X4.
-  gfx.display().requestResync(1);
-  gfx.flush(EInkDisplay::FULL_REFRESH);
+  // Two kinds of sleep (Andrew, 2026-09-05, "lights out"): a nap keeps the
+  // light poster with its live content and a "still connected" dot; OFF is
+  // the same poster inverted, white on black, so the two rest states are
+  // told apart from across the room and in the dark. The content stays on
+  // both: it is useful.
+  if (!napping) gfx.invert();
+}
+
+void drawSleepScreen(Gfx& gfx, const bool napping) {
+  composeSleepScreen(gfx, napping);
+  gLastPosterFingerprint = napping ? frameFingerprint(gfx) : 0;
+  // Through the flush task (no light-sleep slice mid-waveform). OFF is the
+  // deep, clean state and takes the FULL: the inverted poster wants the
+  // strongest black. A nap is quick and reversible: on the X4 it takes the
+  // warmed HALF clean (1.9 s, the vendor's everyday full clean; the true FULL
+  // there runs 3.9 s). The X3's FULL is already 1.9 s and Andrew checked that
+  // poster by hand (2026-09-05), so the X3 keeps it.
+  // The nap should feel as fast as the wake (Andrew, 2026-09-06 11:40,
+  // docs/plans/2026-09-06-nap-entry-speed-spec.md): the X3 nap takes its
+  // HALF (0.72 s, the same clean its pages get every ten turns); the X4 nap
+  // lands FAST (0.6 s) and main.cpp runs a quiet HALF clean four seconds
+  // later while the device naps. OFF keeps the FULL on both.
+  SceneManager::NowTier tier = !napping ? SceneManager::NowTier::Full
+                               : ::gDeviceIsX3 ? SceneManager::NowTier::Half
+                                               : SceneManager::NowTier::Fast;
+  if (Sleep::gPosterTierOverride == 1) tier = SceneManager::NowTier::Half;
+  else if (Sleep::gPosterTierOverride == 2) tier = SceneManager::NowTier::Full;
+  SCENES.flushFramebufferNow(gfx, tier);
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +246,102 @@ void imuSleep() {
 }  // namespace
 
 namespace Sleep {
+uint8_t gPosterTierOverride = 0;
+
+// --- Sleep policy (Settings > Sleep) -------------------------------------
+namespace {
+constexpr uint16_t kNapChoices[] = {2, 5, 10, 15, 30, 0};
+constexpr uint16_t kOffChoices[] = {15, 30, 60, 120, 240, 0};
+uint16_t sNapMin = 0xFFFF, sOffMin = 0xFFFF;  // 0xFFFF = not loaded yet
+uint8_t sFace = 0;
+
+void loadPolicy() {
+  if (sNapMin != 0xFFFF) return;
+  Preferences p;
+  uint16_t nap = XP_AUTO_NAP_MS / 60000UL, off = XP_AUTO_OFF_MS / 60000UL;
+  if (p.begin("sleep", true)) {
+    nap = p.getUShort("napMin", nap);
+    off = p.getUShort("offMin", off);
+    sFace = p.getUChar("face", 0);
+    p.end();
+  }
+  sNapMin = nap;
+  sOffMin = off;
+}
+void storePolicy() {
+  Preferences p;
+  if (!p.begin("sleep", false)) return;
+  p.putUShort("napMin", sNapMin);
+  p.putUShort("offMin", sOffMin);
+  p.putUChar("face", sFace);
+  p.end();
+}
+uint16_t cycleIn(const uint16_t* choices, const size_t n, const uint16_t cur, const int delta) {
+  int idx = 0;
+  for (size_t i = 0; i < n; i++)
+    if (choices[i] == cur) idx = static_cast<int>(i);
+  idx += delta;
+  while (idx < 0) idx += static_cast<int>(n);
+  while (idx >= static_cast<int>(n)) idx -= static_cast<int>(n);
+  return choices[idx];
+}
+}  // namespace
+
+int napChoiceCount() { return static_cast<int>(sizeof(kNapChoices) / sizeof(kNapChoices[0])); }
+uint16_t napChoiceAt(const int i) { return (i >= 0 && i < napChoiceCount()) ? kNapChoices[i] : 0; }
+int offChoiceCount() { return static_cast<int>(sizeof(kOffChoices) / sizeof(kOffChoices[0])); }
+uint16_t offChoiceAt(const int i) { return (i >= 0 && i < offChoiceCount()) ? kOffChoices[i] : 0; }
+
+uint16_t napAfterMin() { loadPolicy(); return sNapMin; }
+uint16_t offAfterMin() { loadPolicy(); return sOffMin; }
+void setNapAfterMin(const uint16_t min) { loadPolicy(); sNapMin = min; storePolicy(); }
+void setOffAfterMin(const uint16_t min) { loadPolicy(); sOffMin = min; storePolicy(); }
+uint16_t cycleNapAfter(const int delta) {
+  setNapAfterMin(cycleIn(kNapChoices, sizeof(kNapChoices) / sizeof(kNapChoices[0]), napAfterMin(), delta));
+  Serial.printf("[xphone-os] settings: nap after %u min\n", static_cast<unsigned>(sNapMin));
+  return sNapMin;
+}
+uint16_t cycleOffAfter(const int delta) {
+  setOffAfterMin(cycleIn(kOffChoices, sizeof(kOffChoices) / sizeof(kOffChoices[0]), offAfterMin(), delta));
+  Serial.printf("[xphone-os] settings: off after %u min\n", static_cast<unsigned>(sOffMin));
+  return sOffMin;
+}
+Face face() { loadPolicy(); return static_cast<Face>(sFace); }
+void setFace(const Face f) { loadPolicy(); sFace = static_cast<uint8_t>(f); storePolicy(); }
+Face cycleFace(const int delta) {
+  (void)delta;  // two choices: any step flips
+  setFace(face() == Face::Priorities ? Face::LastScreen : Face::Priorities);
+  Serial.printf("[xphone-os] settings: sleep screen %s\n", faceName(face()));
+  return face();
+}
+const char* faceName(const Face f) { return f == Face::LastScreen ? "Last screen" : "Priorities"; }
+void formatMinutes(char* out, const size_t n, const uint16_t min) {
+  if (min == 0) snprintf(out, n, "Never");
+  else if (min < 60) snprintf(out, n, "%u min", static_cast<unsigned>(min));
+  else if (min % 60 == 0) snprintf(out, n, "%u h", static_cast<unsigned>(min / 60));
+  else snprintf(out, n, "%u h %02u", static_cast<unsigned>(min / 60), static_cast<unsigned>(min % 60));
+}
+
+void drawSleepScreenNow(Gfx& gfx, const bool napping) {
+  CpuBoost boost;  // the chip idles at 40 MHz; composing the poster there took 4x longer
+  drawSleepScreen(gfx, napping);
+}
+
+bool refreshNapPoster(Gfx& gfx) {
+  CpuBoost boost;
+  SCENES.waitFlushIdle();
+  composeSleepScreen(gfx, /*napping=*/true);
+  const uint32_t fp = frameFingerprint(gfx);
+  if (fp == gLastPosterFingerprint) return false;  // same picture: leave the glass alone
+  gLastPosterFingerprint = fp;
+  // FAST: a differential against the poster the panel already holds, so
+  // only the changed lines move. Ghosting from repeated FASTs is bounded by
+  // the wake repaint (main.cpp: a HALF after several updates).
+  SCENES.flushFramebufferNow(gfx, SceneManager::NowTier::Fast);
+  return true;
+}
+void imuSleepAtBoot() { imuSleep(); }
+
 
 void sleepNow(Gfx& gfx, Input& input) {
   // M5 Phase 1/2: the flush worker must be idle before this function's direct
@@ -240,6 +388,7 @@ void sleepNow(Gfx& gfx, Input& input) {
       prefs.putInt(kBlkTodayKey, blk.blocksToday);
       prefs.putInt(kBlkStreakKey, blk.streak);
       prefs.putInt(kBlkTotalKey, blk.total);
+      prefs.putInt(kBlkMinKey, blk.minutesToday);
 
       // Last Today / Priorities snapshot JSON so the dormant/wake render shows
       // cached data instead of the blank "Syncing" screen (seeded at boot).
@@ -328,7 +477,7 @@ void sleepNow(Gfx& gfx, Input& input) {
     const uint32_t rev0 = PRIORITIES_STORE.revision();
     if (COMPANION_BLE.sendPrioritiesSyncRequest()) {
       const unsigned long tRequest = millis();
-      while (millis() - tRequest < 3500UL) {
+      while (millis() - tRequest < 300UL) {  // 2026-09-05: the phone already pushed these on connect; 1500 timed out twice on the 180 ms link = 3 s of dead time before the sleep screen
         COMPANION_BLE.processPending();
         if (PRIORITIES_STORE.revision() != rev0) break;  // fresh snapshot landed
         delay(25);
@@ -341,7 +490,7 @@ void sleepNow(Gfx& gfx, Input& input) {
     const uint32_t todayRev0 = TODAY_STORE.revision();
     if (COMPANION_BLE.sendTodaySyncRequest()) {
       const unsigned long tRequest = millis();
-      while (millis() - tRequest < 3500UL) {
+      while (millis() - tRequest < 300UL) {  // 2026-09-05: the phone already pushed these on connect; 1500 timed out twice on the 180 ms link = 3 s of dead time before the sleep screen
         COMPANION_BLE.processPending();
         if (TODAY_STORE.revision() != todayRev0) break;  // fresh snapshot landed
         delay(25);
@@ -351,7 +500,7 @@ void sleepNow(Gfx& gfx, Input& input) {
 
   // 1. Sleep screen on glass first (FULL refresh) — everything after this is
   //    invisible teardown, so the device *feels* asleep immediately.
-  drawSleepScreen(gfx);
+  drawSleepScreenNow(gfx, /*napping=*/false);
 
   // 2. BLE: stop advertising cleanly. Full stack teardown is left to the
   //    deep-sleep chip reset (bonds live in NVS and survive; a connected
@@ -397,6 +546,15 @@ void sleepNow(Gfx& gfx, Input& input) {
   //    the power button hard-wires a power-up regardless of the wakeup
   //    source below.
   constexpr gpio_num_t kBatteryLatchPin = GPIO_NUM_13;
+#if XP_LIGHT_SLEEP_LIBS
+  // P4 undo before DEEP sleep. Light sleep keeps every pad in its active
+  // config (gpio_sleep_sel_dis) and holds GPIO13. Deep sleep needs the
+  // opposite: the sleep configs (the wake pin's pull-up lives there) and a
+  // free GPIO13 so the X4 latch can open. Without this the wake pin floated
+  // low and the X3 deep-slept and woke four times in a row (2026-09-03 00:20).
+  for (int pin = 0; pin <= 21; pin++) gpio_sleep_sel_en(static_cast<gpio_num_t>(pin));
+  gpio_hold_dis(kBatteryLatchPin);
+#endif
   gpio_set_direction(kBatteryLatchPin, GPIO_MODE_OUTPUT);
   gpio_set_level(kBatteryLatchPin, 0);
   esp_sleep_config_gpio_isolate();
@@ -420,6 +578,13 @@ void sleepNow(Gfx& gfx, Input& input) {
   while (true) {  // esp_deep_sleep_start() does not return; satisfy [[noreturn]]
     delay(1000);
   }
+}
+
+void armRestoreScene(uint32_t sceneId) {
+  Preferences prefs;
+  if (!prefs.begin(kPrefsNamespace, /*readOnly=*/false)) return;
+  prefs.putUInt(kPrefsSceneKey, sceneId);
+  prefs.end();
 }
 
 bool consumeRestoreScene(uint32_t& sceneId) {
@@ -455,7 +620,7 @@ void seedPersistedBlock() {
   // Completion counters seed regardless of active state (today's count shows on
   // the dormant frame / Block scene even when no block is currently running).
   BLOCK_STATUS.seedCounts(prefs.getInt(kBlkTodayKey, 0), prefs.getInt(kBlkStreakKey, 0),
-                          prefs.getInt(kBlkTotalKey, 0));
+                          prefs.getInt(kBlkTotalKey, 0), prefs.getInt(kBlkMinKey, 0));
 
   // Re-seed the last Today / Priorities snapshots so those scenes render cached
   // data on wake (with a "syncing" indicator) instead of a blank sync screen.

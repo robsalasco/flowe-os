@@ -22,6 +22,38 @@
 //
 // Depth-counted so nested guards (a compose inside a work unit) restore only
 // at the outermost exit. Main loop is single-threaded; no locking needed.
+//
+// Under CONFIG_PM_ENABLE (the x3sleep/x3lean/x3ls packages) the power manager
+// owns the clock: boot calls esp_pm_configure(max 160, min 40), the CPU idles
+// at 40 and the BLE controller's APB lock lifts it to 80 for radio events.
+// A direct setCpuFrequencyMhz() would be undone at the next lock transition,
+// so the boost is an ESP_PM_CPU_FREQ_MAX lock instead: held -> max_freq_mhz,
+// released -> whatever the manager decides. Same depth counting.
+#if CONFIG_PM_ENABLE
+#include <esp_pm.h>
+class CpuBoost {
+ public:
+  CpuBoost() {
+    if (depth()++ == 0) esp_pm_lock_acquire(lock());
+  }
+  ~CpuBoost() {
+    if (--depth() == 0) esp_pm_lock_release(lock());
+  }
+  CpuBoost(const CpuBoost&) = delete;
+  CpuBoost& operator=(const CpuBoost&) = delete;
+
+ private:
+  static esp_pm_lock_handle_t lock() {
+    static esp_pm_lock_handle_t h = nullptr;
+    if (!h) esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "cpuboost", &h);
+    return h;
+  }
+  static int& depth() {
+    static int d = 0;
+    return d;
+  }
+};
+#else
 class CpuBoost {
  public:
   CpuBoost() {
@@ -39,3 +71,5 @@ class CpuBoost {
     return d;
   }
 };
+#endif  // CONFIG_PM_ENABLE
+

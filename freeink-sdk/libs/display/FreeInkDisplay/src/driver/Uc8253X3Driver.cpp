@@ -151,7 +151,7 @@ void Uc8253X3Driver::begin(EpdBus& bus) {
 
 void Uc8253X3Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
   (void)prev;
-  if (!_isScreenOn && !turnOff) {
+  if (!_isScreenOn && !turnOff && !_idleOff) {
     mode = RefreshMode::Half;  // wake transition gets a stronger waveform
   }
   if (_inGrayscaleMode) {
@@ -187,6 +187,7 @@ void Uc8253X3Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev
     bus.cmd(CMD_POWER_ON);
     bus.waitBusy(" X3_PON");
     _isScreenOn = true;
+    _idleOff = false;
   }
   bus.cmd(CMD_DISPLAY_REFRESH);
   bus.waitBusy(" X3_DRF");
@@ -194,6 +195,15 @@ void Uc8253X3Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev
     bus.cmd(CMD_POWER_OFF);
     bus.waitBusy(" X3_POF");
     _isScreenOn = false;
+    _idleOff = false;
+  } else if (_idlePowerOff && fastMode) {
+    // P2 idle power-off: drop the charge pump between page turns. DTM1 (the
+    // previous frame) is retained, so the next turn stays a FAST differential
+    // (_idleOff keeps display() from promoting it to HALF).
+    bus.cmd(CMD_POWER_OFF);
+    bus.waitBusy(" X3_POF_idle");
+    _isScreenOn = false;
+    _idleOff = true;
   }
 
   if (!fastMode) delay(200);

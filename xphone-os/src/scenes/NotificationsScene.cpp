@@ -38,47 +38,56 @@ void truncateToWidth(Gfx& gfx, const XpFont& font, const char* src, int maxWidth
 // One list row: bold title line + regular message line + padding/separator.
 int rowHeight(Gfx& gfx) { return gfx.lineHeight(kFontBold) + gfx.lineHeight(kFontRegular) + 14; }
 
-// Header SYNC pill: a small rounded button in the header's top-right. Sized
-// for the 10pt soft-key font so it reads as a *button*, not a row — the
-// cursor lands on it from row 0 (UP) and the CONFIRM tab relabels to SYNC.
-constexpr int kSyncPillH = 26;
-constexpr uint32_t kSyncFlashMs = 1200;  // pressed-state invert duration
+constexpr uint32_t kSyncFlashMs = 1200;  // "SYNCING..." feedback duration
 }  // namespace
 
 void NotificationsScene::onEnter() {
   _view = View::List;
-  // Default to the first notification (the common case: read, not sync);
-  // an empty inbox parks the cursor on the header SYNC pill instead.
-  _sel = NOTIFICATION_STORE.count() > 0 ? 0 : -1;
+  _sel = 0;
   _scroll = 0;
   _syncFlashUntilMs = 0;
   // Open-triggers-sync, matching the card scenes' onEnter: show what the
   // store already has instantly, and kick a fresh ANCS replay so anything
   // missed mid-session (dropped burst, timed-out fetch) lands within a few
   // seconds — rows repaint live via the store-revision pump in main.cpp.
-  COMPANION_ANCS.requestResync();
+  // A replay that actually starts stamps the header's "synced" clock.
+  if (COMPANION_ANCS.requestResync()) _lastSyncMs = millis();
+}
+
+// The one manual sync entry point (flowe-os#40, heyflorin's design): the
+// key whose tab reads SYNC. Only a replay that actually starts flashes
+// "SYNCING..." and stamps the clock — with no phone connected the header
+// keeps saying what is true.
+void NotificationsScene::syncNow() {
+  if (!COMPANION_ANCS.requestResync()) return;
+  _lastSyncMs = millis();
+  _syncFlashUntilMs = millis() + kSyncFlashMs;
+  if (_syncFlashUntilMs == 0) _syncFlashUntilMs = 1;  // 0 means idle
+  markDirty(headerRect());
 }
 
 const char* const* NotificationsScene::softKeys() const {
   // List: CONFIRM opens the selected row's detail view; its long-press (dot
   // on the tab) clears the whole inbox — CLEAR-the-lot moved off the tap so
-  // one stray press can no longer wipe the list. With the header SYNC pill
-  // selected (_sel == -1) the CONFIRM tab relabels to SYNC — the bar repaints
-  // with every scene repaint, so the label follows the cursor for free.
+  // one stray press can no longer wipe the list.
+  //
+  // Sync rides the UP key at the top of the list (flowe-os#40, heyflorin):
+  // with the cursor on the first row, up has nowhere left to go, so the tab
+  // relabels to SYNC and the press refreshes — the button-world cousin of
+  // pull-to-refresh. An empty inbox is "at the top" by definition.
   static constexpr const char* kList[4] = {"BACK", "OPEN", SoftKey::Up, SoftKey::Down};
-  static constexpr const char* kListSync[4] = {"BACK", "SYNC", SoftKey::Up, SoftKey::Down};
-  static constexpr const char* kListSyncEmpty[4] = {"BACK", "SYNC", nullptr, nullptr};
+  static constexpr const char* kListTop[4] = {"BACK", "OPEN", "SYNC", SoftKey::Down};
+  static constexpr const char* kListEmpty[4] = {"BACK", nullptr, "SYNC", nullptr};
   static constexpr const char* kDetail[4] = {"BACK", "CLEAR", SoftKey::Up, SoftKey::Down};
   if (_view == View::Detail) return kDetail;
-  if (_sel < 0) return NOTIFICATION_STORE.count() > 0 ? kListSync : kListSyncEmpty;
-  return kList;
+  if (NOTIFICATION_STORE.count() == 0) return kListEmpty;
+  return _sel == 0 ? kListTop : kList;
 }
 
 uint8_t NotificationsScene::longPressSlots() const {
   // Bit 1 marks the list's OPEN tab while there is something to clear
-  // (long-press CONFIRM = clear all). No dot on the SYNC pill's tab — sync
-  // has no long-press action, and none on BACK (see Scene::longPressSlots).
-  if (_view == View::List && _sel >= 0 && NOTIFICATION_STORE.count() > 0) return 0x02;
+  // (long-press CONFIRM = clear all); none on BACK (see Scene::longPressSlots).
+  if (_view == View::List && NOTIFICATION_STORE.count() > 0) return 0x02;
   return 0;
 }
 
@@ -127,9 +136,8 @@ void NotificationsScene::moveSelection(const int delta) {
 void NotificationsScene::handleInput(Input& in) {
   const int count = static_cast<int>(NOTIFICATION_STORE.count());
   // Entries may have arrived/expired since the last tick (revision pump) —
-  // re-clamp before any index is used. -1 (header SYNC pill) is a valid
-  // cursor position in the list view; an emptied store forces it.
-  if (_sel > count - 1) _sel = count > 0 ? count - 1 : -1;
+  // re-clamp before any index is used.
+  if (_sel > count - 1) _sel = count > 0 ? count - 1 : 0;
   if (_scroll > _sel && _sel >= 0) _scroll = _sel;
   if (_scroll < 0) _scroll = 0;
 
@@ -142,7 +150,7 @@ void NotificationsScene::handleInput(Input& in) {
   if (_view == View::Detail) {
     if (count == 0) {  // store emptied under us -> fall back to the (empty) list
       _view = View::List;
-      _sel = -1;  // nothing left to select — park on the SYNC pill
+      _sel = 0;
       _scroll = 0;
       markDirty();
       return;
@@ -178,7 +186,7 @@ void NotificationsScene::handleInput(Input& in) {
         const int left = count - 1;
         if (left == 0) {  // inbox now empty -> back to the (empty) list
           _view = View::List;
-          _sel = -1;  // park on the SYNC pill
+          _sel = 0;
           _scroll = 0;
         } else if (_sel > left - 1) {
           _sel = left - 1;  // removed the oldest -> show the previous one
@@ -195,23 +203,14 @@ void NotificationsScene::handleInput(Input& in) {
     showLauncher();
     return;
   }
-  // CLEAR ALL only while a ROW is selected — the SYNC pill's tab has no
-  // long-press action (and no dot), so a held press there stays a no-op.
-  if (in.wasLongPressed(Btn::Confirm) && count > 0 && _sel >= 0) {
+  if (in.wasLongPressed(Btn::Confirm) && count > 0) {
     NOTIFICATION_STORE.clearAll();
-    _sel = -1;  // list is empty now — park on the SYNC pill
+    _sel = 0;
     _scroll = 0;
     markDirty();
     return;
   }
   if (in.wasPressed(Btn::Confirm)) {
-    if (_sel < 0) {  // SYNC: force a fresh ANCS replay on demand
-      COMPANION_ANCS.requestResync();
-      _syncFlashUntilMs = millis() + kSyncFlashMs;
-      if (_syncFlashUntilMs == 0) _syncFlashUntilMs = 1;  // 0 means idle
-      markDirty(headerRect());
-      return;
-    }
     if (count > 0) {  // OPEN the selected row
       _view = View::Detail;
       markDirty();
@@ -219,25 +218,23 @@ void NotificationsScene::handleInput(Input& in) {
     return;
   }
   // Selection: top-edge Up/Down pair AND the front Left/Right buttons — the
-  // latter sit directly under the soft-key bar's UP/DOWN tabs. UP from the
-  // first row steps onto the header SYNC pill (-1); DOWN steps back off it.
+  // latter sit directly under the soft-key bar's tabs. UP at the first row
+  // (or an empty inbox) is the SYNC press — its tab said so.
   if (in.wasPressed(Btn::Up) || in.wasPressed(Btn::Left)) {
     if (_sel > 0) {
       moveSelection(-1);
-    } else if (_sel == 0) {
-      _sel = -1;
-      // Full repaint, not header+row0: the CONFIRM soft-key relabels
-      // OPEN -> SYNC at the panel's bottom edge, outside any small window.
-      markDirty();
+      // Landing on row 0 relabels the up tab to SYNC at the panel's bottom
+      // edge — outside moveSelection's two-row window, so repaint it all.
+      if (_sel == 0) markDirty();
+    } else {
+      syncNow();
     }
   }
   if (in.wasPressed(Btn::Down) || in.wasPressed(Btn::Right)) {
-    if (_sel < 0 && count > 0) {
-      _sel = 0;
-      _scroll = 0;   // pill sits above the list — re-anchor to the top
-      markDirty();   // soft-key relabels back to OPEN (see UP above)
-    } else if (_sel >= 0 && _sel < count - 1) {
+    if (_sel < count - 1) {
+      const bool leftTop = _sel == 0;
       moveSelection(+1);
+      if (leftTop) markDirty();  // SYNC tab returns to an up arrow
     }
   }
 }
@@ -248,7 +245,7 @@ void NotificationsScene::render(Gfx& gfx) {
   _hCache = static_cast<int16_t>(gfx.height());
   _rowsPerPageCache = rowsPerPage(gfx);
   // Same revision-safety clamps as handleInput (render may run first).
-  if (_sel > count - 1) _sel = count > 0 ? count - 1 : -1;
+  if (_sel > count - 1) _sel = count > 0 ? count - 1 : 0;
   if (count == 0 && _view == View::Detail) _view = View::List;
   if (_sel >= 0 && _sel < _scroll) _scroll = _sel;
   if (_sel >= _scroll + _rowsPerPageCache) _scroll = _sel - _rowsPerPageCache + 1;
@@ -271,27 +268,24 @@ void NotificationsScene::renderList(Gfx& gfx) {
   snprintf(line, sizeof(line), "Notifications (%d)", count);
   gfx.drawText(kFontBold, kMarginX, 8, line);
 
-  // SYNC pill (top-right, where the old "n-m" scroll range indicator lived —
-  // the count in the title already tells the story). Three states: idle
-  // (thin outline), cursor-on (thick 3px border, matching the row cursor),
-  // and just-pressed (inverted for kSyncFlashMs — "the press registered"
-  // feedback while the replay lands in the background).
+  // Sync status (top-right, flowe-os#40): quiet words, not a button — the
+  // SYNC control lives in the soft-key bar where every other control lives.
+  // "SYNCING..." for a beat after the press, then how fresh the list is.
   {
-    const bool selected = _sel < 0;
-    const bool flashing = _syncFlashUntilMs != 0;
-    const char* label = flashing ? "SYNCING" : "SYNC";
-    const int textW = gfx.textWidth(kFontSmall, label);
-    const int pillW = textW + 24;
-    const int pillX = w - kMarginX - pillW;
-    const int pillY = (kHeaderH - 2 - kSyncPillH) / 2;  // centred above the rule
-    const int textY = pillY + (kSyncPillH - gfx.lineHeight(kFontSmall)) / 2 + 1;
-    if (flashing) {
-      gfx.fillRoundedRect(pillX, pillY, pillW, kSyncPillH, kSyncPillH / 2, true);
-      gfx.drawTextCentered(kFontSmall, pillX + pillW / 2, textY, label, false);
+    char ago[24];
+    const char* status;
+    if (_syncFlashUntilMs != 0) {
+      status = "SYNCING...";
+    } else if (_lastSyncMs == 0) {
+      status = "NOT SYNCED";  // no phone reachable since this power-on
     } else {
-      gfx.drawRoundedRect(pillX, pillY, pillW, kSyncPillH, kSyncPillH / 2, selected ? 3 : 1, true);
-      gfx.drawTextCentered(kFontSmall, pillX + pillW / 2, textY, label, true);
+      const uint32_t min = (millis() - _lastSyncMs) / 60000u;
+      if (min == 0) snprintf(ago, sizeof(ago), "SYNCED JUST NOW");
+      else if (min < 60) snprintf(ago, sizeof(ago), "SYNCED %luM AGO", static_cast<unsigned long>(min));
+      else snprintf(ago, sizeof(ago), "SYNCED %luH AGO", static_cast<unsigned long>(min / 60));
+      status = ago;
     }
+    gfx.drawText(kFontSmall, w - kMarginX - gfx.textWidth(kFontSmall, status), 14, status);
   }
   gfx.fillRect(0, kHeaderH - 2, w, 2, true);
 

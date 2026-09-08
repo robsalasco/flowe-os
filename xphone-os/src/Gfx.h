@@ -106,6 +106,13 @@ class Gfx {
   EInkDisplay& display() { return _d; }
 
   void clear() { _d.clearScreen(0xFF); }
+  // Flip every pixel of the frame buffer: the OFF sleep poster is white on
+  // black so the two rest states are told apart from across the room.
+  void invert() {
+    if (!_fb) return;
+    const size_t n = _d.getBufferSize();
+    for (size_t i = 0; i < n; i++) _fb[i] = static_cast<uint8_t>(~_fb[i]);
+  }
   void drawPixel(int x, int y, bool black);
   // Straight segment, any slope — for glyph-scale marks (per-pixel cost; use
   // fillRect's byte runs for axis-aligned rules). `thickness` is the side of
@@ -140,6 +147,14 @@ class Gfx {
   // the number of lines drawn (0 for null/empty text).
   int drawTextWrapped(const XpFont& f, int x, int y, const char* text, int maxWidth, int maxLines,
                       bool black = true);
+  // How many lines drawTextWrapped WOULD draw, drawing nothing. Same
+  // algorithm, same breaks — for laying out variable-height rows before
+  // painting them (flowe-os#24).
+  int countWrappedLines(const XpFont& f, const char* text, int maxWidth, int maxLines);
+ private:
+  int wrapText(const XpFont& f, int x, int y, const char* text, int maxWidth, int maxLines, bool black,
+               bool draw);
+ public:
 
   // Refresh tier actually pushed to glass (instrumentation, M2.1a).
   enum class FlushTier : uint8_t { Full, Half, Fast, Partial };

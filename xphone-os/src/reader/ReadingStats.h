@@ -50,6 +50,10 @@ class ReadingStats {
   // (0 when the clock is unknown).
   static uint16_t todayMinutes();
 
+  // Minutes since this session opened its book (0 when no session is
+  // live). Feeds the F1 position stream's "min" field.
+  static uint16_t sessionMinutes();
+
   // Everything the full stats page shows beyond the band: records and
   // lifetime totals derived from the same 64-day ring and book table.
   struct Summary {

@@ -46,6 +46,7 @@ class BlockStatusStore {
     int blocksToday = 0;           // blocks completed today
     int streak = 0;                // consecutive completions (0 after an early stop)
     int total = 0;                 // all-time completed blocks
+    int minutesToday = 0;          // minutes blocked today (flowe-os#20)
     uint32_t revision = 0;         // bumped on every updateFromCard()/seedFromPersisted()
   };
 
@@ -65,7 +66,7 @@ class BlockStatusStore {
   // Seed the completion counters from NVS at boot (independent of active state,
   // so today's block count shows on the dormant frame even with no live block).
   // A fresh block-status card supersedes these via updateFromCard().
-  void seedCounts(int blocksToday, int streak, int total);
+  void seedCounts(int blocksToday, int streak, int total, int minutesToday = 0);
 
   // Copy-out accessor (whole struct, including the revision counter).
   Status get() const { return _status; }

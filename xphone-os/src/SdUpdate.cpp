@@ -20,6 +20,8 @@
 #include <SDCardManager.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
+#include <Preferences.h>
+#include <BatteryMonitor.h>
 #include <esp_rom_crc.h>
 #include <esp_system.h>
 #include <mbedtls/sha256.h>
@@ -531,6 +533,17 @@ bool applyImageAtPath(EInkDisplay& display, const char* path) {
     return false;
   }
 
+  {
+    // Confirm-or-revert: the new slot must reach its first paint within
+    // two boots, or bootRollbackCheck() flips otadata back.
+    Preferences prefs;
+    if (prefs.begin("ota", /*readOnly=*/false)) {
+      prefs.putUChar("pending", 1);
+      prefs.putUChar("boots", 0);
+      prefs.putString("slot", dest->label);
+      prefs.end();
+    }
+  }
   SDUP_LOG("update applied, restarting into %s", dest->label);
   Serial.flush();
   delay(250);
@@ -541,6 +554,78 @@ bool applyImageAtPath(EInkDisplay& display, const char* path) {
 }  // namespace
 
 namespace sd_update {
+
+namespace {
+// Refuse to flash below 30% only when the gauge gives a trusted reading.
+// An unknown reading never blocks an update (X4's ADC path early in boot).
+bool batteryTooLowForFlash() {
+  BatteryMonitor mon;
+  uint16_t pct = 0;
+  if (!mon.readPercentageChecked(pct)) return false;
+  if (pct < 30) {
+    SDUP_LOG("battery %u%% < 30%%: update deferred (file kept)", static_cast<unsigned>(pct));
+    return true;
+  }
+  return false;
+}
+}  // namespace
+
+void bootRollbackCheck() {
+  Preferences prefs;
+  if (!prefs.begin("ota", /*readOnly=*/false)) return;
+  if (prefs.getUChar("pending", 0) == 0) {
+    prefs.end();
+    return;
+  }
+  char slot[20] = {0};
+  prefs.getString("slot", slot, sizeof(slot));
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (!running || std::strcmp(running->label, slot) != 0) {
+    // Someone flashed a different slot by USB/web since the OTA: the flag
+    // no longer describes this firmware. Drop it.
+    SDUP_LOG("ota: pending flag for %s but running %s — cleared", slot, running ? running->label : "?");
+    prefs.putUChar("pending", 0);
+    prefs.end();
+    return;
+  }
+  const uint8_t boots = static_cast<uint8_t>(prefs.getUChar("boots", 0) + 1);
+  prefs.putUChar("boots", boots);
+  SDUP_LOG("ota: pending %s, boot attempt %u", slot, static_cast<unsigned>(boots));
+  if (boots < 3) {
+    prefs.end();
+    return;
+  }
+  // Two boots never confirmed. Revert to the other slot.
+  const esp_partition_t* other = esp_ota_get_next_update_partition(nullptr);
+  prefs.putUChar("pending", 0);
+  prefs.end();
+  if (other && otadataSwitchTo(other)) {
+    SDUP_LOG("ota: REVERTED to %s after %u failed boots", other->label, static_cast<unsigned>(boots));
+    Serial.flush();
+    delay(250);
+    esp_restart();
+  } else {
+    SDUP_LOG("ota: revert failed; staying on %s", slot);
+  }
+}
+
+void confirmBoot() {
+  Preferences prefs;
+  if (!prefs.begin("ota", /*readOnly=*/false)) return;
+  if (prefs.getUChar("pending", 0)) {
+    prefs.putUChar("pending", 0);
+    SDUP_LOG("ota: confirmed %s", esp_ota_get_running_partition()->label);
+  }
+  prefs.end();
+}
+
+bool otaPending() {
+  Preferences prefs;
+  if (!prefs.begin("ota", /*readOnly=*/true)) return false;
+  const bool p = prefs.getUChar("pending", 0) != 0;
+  prefs.end();
+  return p;
+}
 
 void checkAndApply(EInkDisplay& display) {
   // Mount. The shared SPI bus (SCLK=8 / MOSI=10 + SD's MISO=7) must already be
@@ -555,6 +640,7 @@ void checkAndApply(EInkDisplay& display) {
     SDUP_LOG("no %s on SD root — continuing normal boot", UPDATE_PATH);
     return;
   }
+  if (batteryTooLowForFlash()) return;  // file stays; next boot with charge applies it
   applyImageAtPath(display, UPDATE_PATH);  // restarts on success
 }
 

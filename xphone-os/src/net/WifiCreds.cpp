@@ -288,12 +288,44 @@ size_t loadSeen(char* out, const size_t outSize) {
   return strlen(out);
 }
 
+void saveScan(const char* lines) {
+  Preferences p;
+  if (!p.begin(kNamespace, /*readOnly=*/false)) return;
+  p.putString("scanx", lines ? lines : "");
+  p.end();
+}
+
+size_t loadScan(char* out, const size_t outSize) {
+  if (!out || outSize == 0) return 0;
+  out[0] = '\0';
+  Preferences p;
+  if (!p.begin(kNamespace, /*readOnly=*/true)) return 0;
+  p.getString("scanx", out, outSize);
+  p.end();
+  return strlen(out);
+}
+
 void saveFailure(const char* ssid, const int reason80211) {
   Preferences p;
   if (!p.begin(kNamespace, /*readOnly=*/false)) return;
   p.putString(kFailSsidKey, ssid ? ssid : "");
   p.putInt(kFailReasonKey, reason80211);
   p.end();
+}
+
+bool peekFailure(char* ssid, const size_t ssidSize, int* reason) {
+  Preferences p;
+  if (!p.begin(kNamespace, /*readOnly=*/true)) return false;
+  const bool has = p.isKey(kFailSsidKey);
+  if (has) {
+    if (ssid && ssidSize) {
+      ssid[0] = '\0';
+      p.getString(kFailSsidKey, ssid, ssidSize);
+    }
+    if (reason) *reason = p.getInt(kFailReasonKey, 0);
+  }
+  p.end();
+  return has;
 }
 
 bool takeFailure(char* ssid, const size_t ssidSize, int* reason) {
@@ -367,9 +399,12 @@ bool save(const char* ssid, const char* password) {
     clear();
     return true;
   }
-  const bool ok = add(ssid, password);
-  if (ok) markJoined(ssid);
-  return ok;
+  // add() already bumps the slot's use-sequence, so the store walk tries the
+  // new network first. Do NOT mark it "last joined": that label means a real
+  // join now (the device Wi-Fi screen shows it, the target rule reads it),
+  // and adding flowe-test from the phone stole it from 2521Midvale
+  // (bench, 2026-09-05 00:37).
+  return add(ssid, password);
 }
 
 bool hasCreds() { return count() > 0; }

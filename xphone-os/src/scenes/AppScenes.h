@@ -5,6 +5,8 @@
 // The scene instances live as statics in AppScenes.cpp; these helpers are
 // how scenes navigate without including each other's headers.
 
+class Gfx;
+
 #include <cstddef>
 #include <cstdint>
 
@@ -32,6 +34,8 @@ enum class SceneId : uint32_t {
   Reader = 7,
   Workout = 8,
   FileTransfer = 9,
+  Wifi = 10,
+  Home = 11,  // Widget home layout (Phase 2)
 };
 
 // Single source of truth for "what scene is on glass" — set by every show*()
@@ -50,17 +54,39 @@ const char* sceneName(SceneId id);
 void showLauncher();
 void showAbout();
 void readerShelfDump();
+void readerLineCids();
+void readerAcceptGoto(const char* key, uint32_t cid);
 void showNotifications();
 void showSettings();    // M3: real Settings scene (SD update / restart / about)
+void showWifi();        // the device's Wi-Fi screen (roadmap E1, 2026-09-04)
 void showBlock();       // M3: real Block scene (Screen Time shields via BLE)
 void showBlockDeepWork();  // Launcher top-right long-press: open Block + start Deep Work
 void showPriorities();  // M3: real Priorities scene (to-do snapshot via BLE)
 void showToday();       // M3: real Today scene (agenda/reminders/weather card)
 void showReader();      // R1 EPUB reader (resumes the last book; book list on BACK)
 void showWorkout();     // Workout: set-by-set exercise tracker synced from iPhone
+// Declarative app (Phase 1: bench dev console "app <name>"). Loads
+// /apps/<name>/app.json from SD into the generic AppScene and switches to
+// it. Returns false (and stays on the current scene) when loading fails.
+bool showApp(const char* name);
+// Phase 3: an app.data card landed for `name`; reload if it is on glass.
+void appDataArrived(const char* name);
+void showHome();  // Widget home layout; falls back to launcher if layout=Tiles
+void markHomeDirtyIfActive();
+void homeDebugDump();  // bench: print the hero snapshot
+// Sleep face for the Widget layout: the frozen hero. False = use the poster.
+bool homeRenderDormant(Gfx& gfx);
 void showFileTransfer();           // R2: Wi-Fi File Transfer scene (Idle menu)
 void showFileTransferAutoStart();  // R2: same, but bring Wi-Fi up immediately (BLE transfer.start)
 void showFileTransferAutoStartDirect();
+// Sync in place: the phone's transfer.start / transfer.direct with the
+// previous screen's picture kept on glass and a pill in the header.
+void showFileTransferAutoStartInPlace(bool direct);
+// showSceneById, but the reader comes back without the "Opening book..."
+// frame: its page is still on glass from before the sync.
+void showSceneByIdQuiet(SceneId id);
+// Restart as a wake and land on `id` (main.cpp). For memory recovery only.
+void quietRestartToScene(uint32_t id);
 // A transfer card while the scene is already up: behave like a fresh entry.
 void fileTransferRestartFromCard(bool direct);  // W2: raise the device's own hotspot (BLE transfer.direct)
 // R2: BLE "transfer.stop" — ack + restart when the transfer scene is active

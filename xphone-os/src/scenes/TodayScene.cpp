@@ -111,36 +111,38 @@ void drawBell(Gfx& g, int x, int y, int d) {
 
 }  // namespace
 
-// buildRows: events first, grouped by day bucket — a DayDivider is emitted each
-// time the bucket (item.subtitle, e.g. "TONIGHT"/"TOMORROW", set by the iOS
-// producer) changes. Reminders follow under one "Reminders" header. The phone
-// owns the sort; we only insert the dividers/header.
+// buildRows: ONE pass in the phone's item order — the phone sends today's
+// events, then today's reminders, then tomorrow's events in whatever room
+// was left (flowe-os#39: today always wins the space). A DayDivider is
+// emitted when the bucket (item.subtitle, e.g. "TONIGHT"/"TOMORROW") changes
+// between events; the first reminder opens one "Reminders" header. Events
+// resuming AFTER the reminders (the tomorrow filler) get their divider from
+// the same bucket rule.
 int TodayScene::buildRows(Row (&rows)[MAX_ROWS]) const {
   int n = 0;
   TodayStore::Item item;
   char lastBucket[sizeof(item.subtitle)] = {0};
   bool haveBucket = false;
+  bool remHeader = false;
 
   const int count = static_cast<int>(TODAY_STORE.count());
-  for (int i = 0; i < count && n < MAX_ROWS - 1; i++) {
+  for (int i = 0; i < count && n < MAX_ROWS; i++) {
     if (!TODAY_STORE.get(static_cast<std::size_t>(i), item)) continue;
-    if (strcmp(item.kind, "reminder") == 0) continue;  // events only in this pass
+    if (item.reminder) {
+      if (!remHeader) {
+        if (n >= MAX_ROWS - 1) break;
+        rows[n++] = Row{RowType::SectionReminders, -1};
+        remHeader = true;
+        haveBucket = false;  // an event after the reminders re-labels its day
+      }
+      rows[n++] = Row{RowType::Item, static_cast<int8_t>(i)};
+      continue;
+    }
     if (!haveBucket || strcmp(item.subtitle, lastBucket) != 0) {
+      if (n >= MAX_ROWS - 1) break;
       rows[n++] = Row{RowType::DayDivider, static_cast<int8_t>(i)};
       snprintf(lastBucket, sizeof(lastBucket), "%s", item.subtitle);
       haveBucket = true;
-    }
-    rows[n++] = Row{RowType::Item, static_cast<int8_t>(i)};
-  }
-
-  bool remHeader = false;
-  for (int i = 0; i < count && n < MAX_ROWS; i++) {
-    if (!TODAY_STORE.get(static_cast<std::size_t>(i), item)) continue;
-    if (strcmp(item.kind, "reminder") != 0) continue;
-    if (!remHeader) {
-      if (n >= MAX_ROWS - 1) break;
-      rows[n++] = Row{RowType::SectionReminders, -1};
-      remHeader = true;
     }
     rows[n++] = Row{RowType::Item, static_cast<int8_t>(i)};
   }
@@ -161,9 +163,17 @@ void TodayScene::requestSync() {
 }
 
 const char* const* TodayScene::softKeys() const {
-  static constexpr const char* kFull[4] = {"BACK", "SYNC", SoftKey::Up, SoftKey::Down};
-  static constexpr const char* kEmpty[4] = {"BACK", "SYNC", nullptr, nullptr};
-  return TODAY_STORE.hasSnapshot() ? kFull : kEmpty;
+  // Sync rides the UP key at the top of the list, the same pattern as
+  // Notifications (flowe-os#40): scrolled to the top, up has nowhere to
+  // go, so the tab relabels to SYNC and the press refreshes. Scrolled
+  // down, it is an honest up-arrow again.
+  static constexpr const char* kTop[4] = {"BACK", nullptr, "SYNC", SoftKey::Down};
+  static constexpr const char* kScrolled[4] = {"BACK", nullptr, SoftKey::Up, SoftKey::Down};
+  static constexpr const char* kEmpty[4] = {"BACK", nullptr, "SYNC", nullptr};
+  // A day that fits the screen has nothing to scroll: no down arrow either
+  // (a tab that does nothing is a lie about the button under it).
+  if (!TODAY_STORE.hasSnapshot() || _maxScrollCache == 0) return kEmpty;
+  return _scroll == 0 ? kTop : kScrolled;
 }
 
 XpRect TodayScene::contentRect() const {
@@ -176,18 +186,25 @@ void TodayScene::handleInput(Input& in) {
     showLauncher();
     return;
   }
-  if (in.wasPressed(Btn::Confirm)) {  // SYNC: re-request the snapshot
-    requestSync();
-    markDirty();
-    return;
+  if (in.wasPressed(Btn::Up) || in.wasPressed(Btn::Left)) {
+    if (_scroll > 0) {
+      _scroll--;
+      // Landing back at the top relabels the up tab to SYNC at the
+      // panel's bottom edge — outside the content window.
+      if (_scroll == 0) markDirty();
+      else markDirty(contentRect());
+    } else {  // at the top: the tab says SYNC, and it means it
+      requestSync();
+      markDirty();
+    }
   }
-  if ((in.wasPressed(Btn::Up) || in.wasPressed(Btn::Left)) && _scroll > 0) {
-    _scroll--;
-    markDirty(contentRect());
-  }
-  if ((in.wasPressed(Btn::Down) || in.wasPressed(Btn::Right)) && _scroll < _maxScrollCache) {
-    _scroll++;
-    markDirty(contentRect());
+  if (in.wasPressed(Btn::Down) || in.wasPressed(Btn::Right)) {
+    if (_scroll < _maxScrollCache) {
+      const bool leftTop = _scroll == 0;
+      _scroll++;
+      if (leftTop) markDirty();  // SYNC tab returns to an up arrow
+      else markDirty(contentRect());
+    }
   }
 }
 
@@ -322,7 +339,7 @@ void TodayScene::render(Gfx& gfx) {
       case RowType::Item:
       default: {
         if (!TODAY_STORE.get(static_cast<std::size_t>(r.item), item)) break;
-        const bool reminder = strcmp(item.kind, "reminder") == 0;
+        const bool reminder = item.reminder;
         const int textX = reminder ? kMarginX + kRemGutter : kMarginX;
         const int lineW = reminder ? textW - kRemGutter : textW;
         // Checkbox on individual reminders, vertically nudged onto the block.

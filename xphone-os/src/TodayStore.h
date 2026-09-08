@@ -23,21 +23,26 @@ struct CompanionCardState;
 
 class TodayStore {
  public:
-  // Capacity/field sizes mirror CompanionProtocol (MAX_TODAY_ITEMS,
-  // MAX_ID_CHARS + NUL, MAX_TODAY_FIELD_CHARS + NUL, MAX_TITLE_CHARS + NUL);
-  // static_asserts in the .cpp keep them in lockstep.
-  static constexpr std::size_t CAPACITY = 6;
+  // Capacity mirrors CompanionProtocol::MAX_TODAY_ITEMS (static_assert in
+  // the .cpp). The fields are a deliberate DIET of the wire limits: the old
+  // Item spent 65 bytes storing the word "reminder" (one bit) and 49 on
+  // "9:00 AM". 16 dieted items cost ~2.8 KB where 6 fat ones cost 1.6 KB —
+  // that is what makes the scrollable Today affordable on the X3's heap
+  // headroom (flowe-os#39). updateFromCard clips into these sizes.
+  static constexpr std::size_t CAPACITY = 16;
 
   struct Item {
-    char kind[65] = {0};      // "reminder" selects the Reminders section; anything else is agenda
-    char time[49] = {0};      // e.g. "9:00 AM" ("" for undated reminders)
+    bool reminder = false;    // card kind == "reminder" -> the Reminders section
+    char time[25] = {0};      // e.g. "9:00 AM" ("" for undated reminders)
     char title[97] = {0};
-    char subtitle[49] = {0};  // "" -> the scene falls back to `kind`, like x4-os TodayActivity
-  };  // 260 bytes
+    char subtitle[49] = {0};  // events: day-bucket label ("TODAY"/"TOMORROW")
+  };  // ~172 bytes
 
   // Copy the card's today items + weather/high-low/sync lines into the fixed
   // buffers and bump the revision. Call ONLY when the card actually is a
-  // today snapshot — the service's predicate decides.
+  // today snapshot — the service's predicate decides. Multi-part snapshots
+  // (card.parts > 1, slices sharing one card id) stage across calls and
+  // commit on the final part, the same discipline as PrioritiesStore.
   void updateFromCard(const CompanionCardState& card);
 
   bool hasSnapshot() const { return _hasSnapshot; }
@@ -57,6 +62,10 @@ class TodayStore {
  private:
   Item _items[CAPACITY];
   std::size_t _count = 0;
+  // Multi-part staging cursor: slices fill _items in order and _count only
+  // moves on the final part, so renders between parts see the OLD snapshot.
+  std::size_t _stageCount = 0;
+  char _stageId[24] = {0};
   bool _hasSnapshot = false;
   char _weather[97] = {0};
   char _highLow[97] = {0};

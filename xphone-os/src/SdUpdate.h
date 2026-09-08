@@ -42,4 +42,13 @@ void checkAndApply(EInkDisplay& display);
 // boot selection untouched, and returns false.
 bool flashFromPath(EInkDisplay& display, const char* path);
 
+// Confirm-or-revert safety net (Phase 4). A flash marks the new slot
+// PENDING in NVS. Every boot counts; if the firmware never reaches its
+// first paint after two tries, the third boot flips otadata back to the
+// other slot and restarts. confirmBoot() clears the flag at first paint.
+// A USB/web flash that changes the running slot clears a stale flag.
+void bootRollbackCheck();   // call EARLY in boot(), before checkAndApply
+void confirmBoot();         // call right after the first paint
+bool otaPending();          // for device.info
+
 }  // namespace sd_update

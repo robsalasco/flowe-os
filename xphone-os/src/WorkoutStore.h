@@ -30,9 +30,15 @@ class WorkoutStore {
   struct Item {
     char id[65] = {0};    // echoed back in workout.set — kept verbatim
     char name[49] = {0};  // free text: "Pushups x10", "Bench 135lb"
-    int sets = 0;         // target set count (1..99)
-    int done = 0;         // completed sets (0..sets)
+    int sets = 0;         // target set count (1..99); 0 = OPEN set (no target,
+                          // flowe-os#19) — done climbs freely, capped at kOpenCap
+    int done = 0;         // completed sets (0..sets, or 0..kOpenCap when open)
   };
+  static constexpr int kOpenCap = 999;
+
+  // An exercise is complete when it reached its target, or — for an open
+  // set — when at least one set was counted.
+  static bool isComplete(const Item& it) { return it.sets > 0 ? it.done >= it.sets : it.done > 0; }
 
   // Copy the card's workout items + date into the fixed buffers and bump the
   // revision. Call ONLY for workout snapshot cards — the service's predicate

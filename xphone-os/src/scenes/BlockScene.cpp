@@ -467,9 +467,19 @@ void BlockScene::renderReady(Gfx& gfx, const BlockStatusStore::Status& card) con
   // finished at least one). Motivation to keep the streak alive.
   int heroBandTop = rowBottom + 12 + gfx.lineHeight(kFontRegular) + 6;
   const BlockStatusStore::Status stats = BLOCK_STATUS.get();
-  if (stats.total > 0 || stats.blocksToday > 0) {
-    char line[56];
-    snprintf(line, sizeof(line), "Today %d      Streak %d", stats.blocksToday, stats.streak);
+  if (stats.total > 0 || stats.blocksToday > 0 || stats.minutesToday > 0) {
+    // "Today 1h 35m   2 blocks   Streak 6" — minutes per day is flowe-os#20.
+    // (ASCII-only fonts: no middle dot.)
+    char mins[16];
+    if (stats.minutesToday >= 60) {
+      if (stats.minutesToday % 60 == 0) snprintf(mins, sizeof(mins), "%dh", stats.minutesToday / 60);
+      else snprintf(mins, sizeof(mins), "%dh %dm", stats.minutesToday / 60, stats.minutesToday % 60);
+    } else {
+      snprintf(mins, sizeof(mins), "%dm", stats.minutesToday);
+    }
+    char line[72];
+    snprintf(line, sizeof(line), "Today %s    %d block%s    Streak %d", mins, stats.blocksToday,
+             stats.blocksToday == 1 ? "" : "s", stats.streak);
     gfx.drawTextCentered(kFontSmall, cx, heroBandTop, line);
     heroBandTop += gfx.lineHeight(kFontSmall) + 10;
   }

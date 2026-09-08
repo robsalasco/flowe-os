@@ -40,7 +40,9 @@ class TodayScene : public Scene {
   // scroll offset has one honest index space. Worst case is 6 events each in a
   // distinct day bucket (6 dividers + 6 items) or a mix with the reminders
   // header — bounded by 6 items + <=6 dividers + 1 header.
-  static constexpr int MAX_ROWS = 14;
+  // 16 items (flowe-os#39) + day dividers (a handful of buckets) + one
+  // Reminders header. The scene scrolls, so every row can exist at once.
+  static constexpr int MAX_ROWS = 24;
   // DayDivider carries an event's day-bucket label (TONIGHT/TOMORROW/...) via
   // its item index (the divider reads item.subtitle). SectionReminders is the
   // single "Reminders" header. Item is an event or reminder row.

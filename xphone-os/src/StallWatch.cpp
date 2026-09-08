@@ -40,7 +40,11 @@ volatile uint32_t gWorstMs = 0;
 bool gStarted = false;
 
 StaticTask_t gTcb;
-StackType_t gStack[2048];
+// 2560. The 2026-09-02 trim to 1536 overflowed under light sleep: two
+// core dumps (X3 overnight, X4 mid-upload) show this task crashing at the
+// interrupt entry with SP outside its stack. printf + an interrupt frame
+// need more than a line's worth.
+StackType_t gStack[2560];
 
 void watchTask(void*) {
   uint32_t lastBeat = gBeat;

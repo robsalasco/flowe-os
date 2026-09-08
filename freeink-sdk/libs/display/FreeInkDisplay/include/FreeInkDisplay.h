@@ -116,6 +116,12 @@ class FreeInkDisplay {
 
   // Power management
   void deepSleep();
+  // P2 idle power-off passthrough (see PanelDriver::setIdlePowerOff).
+  void setIdlePowerOff(bool on);
+  bool idlePowerOff() const;
+  void setHalfTemp(int8_t c);
+  void setFirstRefreshFull(bool on);
+  int8_t halfTemp() const;
 
   // Access to frame buffer
   uint8_t* getFrameBuffer() const { return frameBuffer; }

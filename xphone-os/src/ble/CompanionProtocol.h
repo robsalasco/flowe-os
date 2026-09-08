@@ -26,10 +26,16 @@ inline const char* deviceName() { return ::gDeviceIsX3 ? "xphone X3" : "xphone X
 constexpr const char* SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr const char* CARD_WRITE_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr const char* ACTION_NOTIFY_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+// The Bluetooth slow lane (2026-09-04): raw book frames, write-with-response,
+// encrypted. [4-byte LE offset][bytes]. Control rides on the card
+// characteristic as "book.begin" / "book.end".
+constexpr const char* FILE_WRITE_UUID = "6E400004-B5A3-F393-E0A9-E50E24DCCA9E";
 
 constexpr std::size_t MAX_ACTIONS = 4;
-constexpr std::size_t MAX_TODAY_ITEMS = 6;
-constexpr std::size_t MAX_MAIL_ITEMS = 8;
+// 16 since the scrollable Today rework (flowe-os#39): a heavy calendar day
+// fits whole. Cards larger than one GATT write ship as multi-part slices,
+// the same mechanism priorities snapshots use.
+constexpr std::size_t MAX_TODAY_ITEMS = 16;
 constexpr std::size_t MAX_PRIORITY_ITEMS = 10;
 constexpr std::size_t MAX_WORKOUT_ITEMS = 8;
 constexpr std::size_t MAX_WORKOUT_NAME_CHARS = 48;
@@ -79,14 +85,7 @@ struct CompanionWorkoutItem {
   int done = 0;
 };
 
-struct CompanionMailItem {
-  std::string id;
-  std::string from;
-  std::string subject;
-  std::string preview;
-  std::string time;
-  std::string state;
-};
+// (CompanionMailItem removed 2026-09-02: parsed by nobody, read by nobody.)
 
 struct CompanionCardState {
   bool hasCard = false;
@@ -101,8 +100,6 @@ struct CompanionCardState {
   std::string todayWeather;
   std::string todayHighLow;
   std::string todaySync;
-  std::string mailSource;
-  std::string mailSync;
   // M4.2 Block: iPhone-formatted block end time ("10:30 AM"); "" on
   // ready/idle/older iOS. Feeds BlockStatusStore + the dormant sleep frame.
   std::string endsAtLabel;
@@ -114,12 +111,11 @@ struct CompanionCardState {
   int blocksToday = 0;
   int blockStreak = 0;
   int blocksTotal = 0;
+  int blockMinutesToday = 0;  // minutes blocked today (flowe-os#20); older apps omit -> 0
   std::array<CompanionCardAction, CompanionProtocol::MAX_ACTIONS> actions;
   std::size_t actionCount = 0;
   std::array<CompanionTodayItem, CompanionProtocol::MAX_TODAY_ITEMS> todayItems;
   std::size_t todayItemCount = 0;
-  std::array<CompanionMailItem, CompanionProtocol::MAX_MAIL_ITEMS> mailItems;
-  std::size_t mailItemCount = 0;
   std::array<CompanionPriorityItem, CompanionProtocol::MAX_PRIORITY_ITEMS> priorityItems;
   std::size_t priorityItemCount = 0;
   // Multi-part snapshot cards: a single GATT write caps a card at ~512 bytes,

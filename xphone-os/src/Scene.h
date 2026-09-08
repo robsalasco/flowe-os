@@ -81,6 +81,9 @@ class Scene {
   virtual void handleInput(Input& in) = 0;
   // Compose the full scene into the framebuffer (already cleared to white).
   virtual void render(Gfx& gfx) = 0;
+  // Sync in place: a scene that runs behind the previous picture says so,
+  // and the manager drops its dirty flag instead of composing a frame.
+  virtual bool suppressRepaint() const { return false; }
 
   bool isDirty() const { return _dirty; }
   // Full-panel dirty (unknown/most of the screen changed).
@@ -138,6 +141,38 @@ class SceneManager {
   // Exit the old scene, enter the new one; next render uses a FULL refresh.
   void switchTo(Scene& s);
 
+  // The next paint of the active scene is a FULL refresh (clean slate), used
+  // when coming back from the sleep screen without a scene switch.
+  void requestFullRepaint() {
+    _needFull = true;
+    if (_active) _active->markDirty();
+  }
+  // Same, but the next paint is the HALF ghost scrub: used when the nap
+  // poster took several FAST updates and the wake should clean their traces.
+  void requestScrubRepaint() {
+    requestFullRepaint();
+    _sinceScrub = kScrubAfterRefreshes;
+  }
+
+  // While paused (the nap: the sleep screen is on the glass) no scene paints,
+  // whoever asks — loop(), renderNow(), a card handler. Dirty flags keep
+  // accumulating, so the first paint after the pause shows everything.
+  void setPaused(bool paused) { _paused = paused; }
+  bool paused() const { return _paused; }
+
+  // Flush the frame buffer as it is, through the flush task (which holds the
+  // no-light-sleep and APB locks), and wait for it. A direct gfx.flush() from
+  // the main task can be interrupted by a light-sleep slice: the X4 napped
+  // mid-waveform and the sleep poster never reached the glass (2026-09-05).
+  enum class NowTier : uint8_t { Fast, Half, Full };
+  void flushFramebufferNow(Gfx& gfx, NowTier tier) {
+    waitFlushIdle();
+    ensureFlushTask(gfx);
+    dispatchFlush(tier == NowTier::Full ? FlushReq::Full : tier == NowTier::Half ? FlushReq::Half : FlushReq::Fast,
+                  XpRect{0, 0, 0, 0});
+    waitFlushIdle();
+  }
+
   // One tick: OS-wide long-press BACK -> launcher, else forward input to the
   // active scene; then repaint if dirty. (Defined in Scene.cpp: it needs the
   // AppScenes navigation helpers.)
@@ -155,20 +190,38 @@ class SceneManager {
   // moved" — 2026-08-18). Same thread as loop(); renderIfDirty already
   // defers while the flush worker is busy. No-op before the first render.
   void renderNow();
+  // Sync in place: compose the active scene's frame into the framebuffer
+  // without flushing, so a scene that takes over silently paints its pill
+  // over the picture that is really on glass (the framebuffer may hold an
+  // older frame: the reader lends it out as a decode window).
+  void composeActive(Gfx& gfx);
 
   // M5 responsiveness (Phase 2): true while the flush worker is driving the
   // panel. renderIfDirty() defers composing while set (state keeps advancing;
   // the next compose shows the newest state — natural coalescing).
   bool flushInFlight() const { return _flushInFlight; }
+  TaskHandle_t flushTask() const { return _flushTask; }  // stats: stack high-water mark
   // Block until the worker is idle. MUST be called before any direct
   // gfx.flush()/panel teardown outside the worker (Sleep::sleepNow, restart).
   void waitFlushIdle() const;
 
  private:
   Scene* _active = nullptr;
+  bool _paused = false;
   bool _needFull = false;
   // M2.1a refresh discipline state.
   uint8_t _sinceScrub = 0;   // FAST/PARTIAL refreshes since the last FULL/HALF
+  // X4, 2026-09-07 (Andrew: "the book gallery and the home screen collide").
+  // A windowed update that starts the instant a FULL-PANEL update finishes
+  // brings the pre-full image back everywhere outside its window. Proven on
+  // the bench: gallery -> BACK -> a Left press 150 ms later left the launcher
+  // only inside the window and the whole book grid around it, while the
+  // framebuffer held a perfect launcher. A settled window after the same
+  // full-panel update is clean, and a window after a window is clean, so the
+  // panel needs the full-panel waveform to finish settling before it can be
+  // driven differentially again. Promote that one repaint to full-panel: it
+  // costs ~30 ms (PARTIAL 551-579 ms vs FAST 594 ms) and only in this race.
+  bool _deferredBehindFullPanel = false;
   uint8_t _bootFlushes = 0;  // full-panel flushes since boot (panel conditioning gate)
 
   // M5 Phase 2 — flush worker: the loop task composes the frame (stores are

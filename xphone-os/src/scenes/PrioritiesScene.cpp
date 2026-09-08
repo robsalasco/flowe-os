@@ -5,6 +5,7 @@
 
 #include "../BlockStatusStore.h"
 #include "../Fonts.h"
+#include "../StatusBar.h"
 #include "../PrioritiesStore.h"
 #include "../SyncIndicator.h"
 #include "../TodayStore.h"
@@ -68,12 +69,6 @@ void drawCheckbox(Gfx& gfx, const int x, const int y, const bool checked, const 
   gfx.drawLine(x + 13, y + 22, x + 24, y + 10, 3, true);  // long up-right stroke
 }
 
-// Crescent moon for the dormant stamp: full disc, then a white disc offset
-// up-right carves it (paper is white, so the carve just erases).
-void drawMoon(Gfx& gfx, const int x, const int y, const int d) {
-  gfx.fillRoundedRect(x, y, d, d, d / 2, true);
-  gfx.fillRoundedRect(x + d / 3, y - d / 5, d, d, d / 2, false);
-}
 
 // Small padlock glyph for the dormant BLOCK stamp — the same primitives as
 // BlockScene::drawLock (rounded shackle + filled body + carved keyhole) but
@@ -269,20 +264,58 @@ void PrioritiesScene::render(Gfx& gfx) {
     gfx.drawText(kFontSmall, kMarginX, syncY, sync);
   }
 
-  // --- Rows (PrioritiesActivity renderList, X3 metrics) ---------------------
-  const int rowH = gfx.lineHeight(kFontBold) + gfx.lineHeight(kFontSmall) + 22;
+  // --- Rows (flowe-os#24: long titles WRAP, they do not get cut) ----------
+  // Rows are variable height: the title takes up to two lines, the note one
+  // small line under it. Heights are measured with the BOLD face (the
+  // selected row's), so a row never changes size as the cursor passes.
   const int listTop = syncY + gfx.lineHeight(kFontSmall) + 12;
-  const int avail = h - Scene::SOFTKEY_BAR_H - 8 - listTop;
-  int perPage = avail / rowH;
-  if (perPage < 1) perPage = 1;
-  _rowsPerPageCache = perPage;
+  const int listBottom = h - Scene::SOFTKEY_BAR_H - 8;
+  const int textX = kMarginX + 14 + kCheckboxSize + 16;
+  const int textW = w - kMarginX - 14 - textX;
+  constexpr int kTitleMaxLines = 2;
+  auto rowHeightOf = [&](const PrioritiesStore::Item& it) {
+    const int lines = gfx.countWrappedLines(kFontBold, it.title, textW, kTitleMaxLines);
+    const int titleH = (lines > 0 ? lines : 1) * gfx.lineHeight(kFontBold);
+    const int noteH = noteIsReal(it.note) ? gfx.lineHeight(kFontSmall) : 0;
+    const int minH = kCheckboxSize + 16;  // never shorter than the checkbox wants
+    const int hgt = titleH + noteH + 22;
+    return hgt < minH ? minH : hgt;
+  };
 
-  // Scroll window follows the selection.
+  // How many rows fit from a given first row.
+  auto fitFrom = [&](int first) {
+    int y = listTop, n = 0;
+    PrioritiesStore::Item it;
+    for (int i = first; i < count; i++) {
+      if (!PRIORITIES_STORE.get(static_cast<std::size_t>(i), it)) break;
+      const int rh = rowHeightOf(it);
+      if (y + rh > listBottom) break;
+      y += rh;
+      n++;
+    }
+    return n > 0 ? n : 1;  // a row taller than the list still shows (clipped)
+  };
+
+  // Scroll window follows the selection, in rows that actually fit; and it
+  // never scrolls past the point where the tail fills the list (the Today
+  // scene's rule), so no blank space sits under the last row.
+  int maxScroll = 0;
+  {
+    int used = 0;
+    PrioritiesStore::Item it;
+    for (int i = count - 1; i >= 0; i--) {
+      if (!PRIORITIES_STORE.get(static_cast<std::size_t>(i), it)) break;
+      used += rowHeightOf(it);
+      if (used > listBottom - listTop) break;
+      maxScroll = i;
+    }
+  }
   if (_sel < _scroll) _scroll = _sel;
-  if (_sel >= _scroll + perPage) _scroll = _sel - perPage + 1;
-  const int maxScroll = count > perPage ? count - perPage : 0;
-  if (_scroll > maxScroll) _scroll = maxScroll;
+  while (_scroll < _sel && _sel >= _scroll + fitFrom(_scroll)) _scroll++;
+  if (_scroll > maxScroll && _sel >= maxScroll && _sel < maxScroll + fitFrom(maxScroll)) _scroll = maxScroll;
   if (_scroll < 0) _scroll = 0;
+  const int perPage = fitFrom(_scroll);
+  _rowsPerPageCache = perPage;
 
   if (count > perPage) {  // range indicator, right-aligned on the sync line
     char range[24];
@@ -297,6 +330,7 @@ void PrioritiesScene::render(Gfx& gfx) {
     PrioritiesStore::Item item;
     if (!PRIORITIES_STORE.get(static_cast<std::size_t>(i), item)) break;
     const bool selected = i == _sel;
+    const int rowH = rowHeightOf(item);
     const int cardH = rowH - 8;
 
     if (selected) {
@@ -307,22 +341,19 @@ void PrioritiesScene::render(Gfx& gfx) {
 
     drawCheckbox(gfx, kMarginX + 14, y + (cardH - kCheckboxSize) / 2, item.done, selected ? 3 : 2);
 
-    const int textX = kMarginX + 14 + kCheckboxSize + 16;
-    const int textW = w - kMarginX - 14 - textX;
     const XpFont& titleFont = selected ? kFontBold : kFontRegular;
-    // A row without a note is a single-line row: the title alone is centered
-    // in the card, level with the checkbox — no placeholder text underneath.
     const char* noteSrc = noteIsReal(item.note) ? item.note : "";
-    const int textBlockH = gfx.lineHeight(titleFont) + (noteSrc[0] ? gfx.lineHeight(kFontSmall) : 0);
+    // Centre the text block (measured in bold) in the card, like before.
+    const int titleLines = gfx.countWrappedLines(kFontBold, item.title, textW, kTitleMaxLines);
+    const int textBlockH = (titleLines > 0 ? titleLines : 1) * gfx.lineHeight(kFontBold) +
+                           (noteSrc[0] ? gfx.lineHeight(kFontSmall) : 0);
     const int textTop = y + (cardH - textBlockH) / 2;
-    char title[96];
-    truncateToWidth(gfx, titleFont, item.title, textW, title, sizeof(title));
-    gfx.drawText(titleFont, textX, textTop, title);
+    const int drawn = gfx.drawTextWrapped(titleFont, textX, textTop, item.title, textW, kTitleMaxLines);
 
     if (noteSrc[0]) {
       char note[128];
       truncateToWidth(gfx, kFontSmall, noteSrc, textW, note, sizeof(note));
-      gfx.drawText(kFontSmall, textX, textTop + gfx.lineHeight(titleFont), note);
+      gfx.drawText(kFontSmall, textX, textTop + (drawn > 0 ? drawn : 1) * gfx.lineHeight(titleFont), note);
     }
     y += rowH;
   }
@@ -334,7 +365,33 @@ void PrioritiesScene::render(Gfx& gfx) {
 // single-line rows (notes omitted — undone bold, done regular + ticked), and
 // a bottom "moon + xphone" stamp with the wake hint. No RTC on X3/X4, so no
 // "synced Xm ago" line.
-bool PrioritiesScene::renderDormant(Gfx& gfx) {
+// The wake hint, one centred line at the foot of every sleep poster: a
+// crescent and "napping" for the light rest, a full disc and "asleep" for
+// off (that page is inverted afterwards, so the disc reads as a full moon
+// on black). It sits at h-56; the list ends at h-176, the calendar and
+// block lines use h-108 and h-148, so it never meets them, at ten
+// priorities or a hundred.
+// Crescent moon for the dormant stamp: full disc, then a white disc offset
+// up-right carves it (paper is white, so the carve just erases).
+void drawMoon(Gfx& gfx, const int x, const int y, const int d) {
+  gfx.fillRoundedRect(x, y, d, d, d / 2, true);
+  gfx.fillRoundedRect(x + d / 3, y - d / 5, d, d, d / 2, false);
+}
+
+void PrioritiesScene::renderDormantWakeHint(Gfx& gfx, const bool napping) {
+  const int cx = gfx.width() / 2;
+  const int y = gfx.height() - 56;
+  const char* text = napping ? "napping: press power to wake" : "asleep: press power to wake";
+  constexpr int kD = 16, kGap = 8;
+  const int tw = gfx.textWidth(kFontSmall, text);
+  const int gx = cx - (kD + kGap + tw) / 2;
+  const int gy = y + (gfx.lineHeight(kFontSmall) - kD) / 2;
+  if (napping) drawMoon(gfx, gx, gy, kD);
+  else gfx.fillRoundedRect(gx, gy, kD, kD, kD / 2, true);
+  gfx.drawText(kFontSmall, gx + kD + kGap, y, text);
+}
+
+bool PrioritiesScene::renderDormant(Gfx& gfx, const bool napping) {
   const int count = static_cast<int>(PRIORITIES_STORE.count());
   if (count == 0) return false;
 
@@ -399,13 +456,13 @@ bool PrioritiesScene::renderDormant(Gfx& gfx) {
   if (!blockDrawn && !calDrawn) {
     // Nothing to say: the calm crescent + wordmark.
     const int gap = 12;
-    const char* kWordmark = "xphone";
+    const char* kWordmark = "flowe";
     const int moonD = 22;
     const int gx = cx - (moonD + gap + gfx.textWidth(kFontBold, kWordmark)) / 2;
     drawMoon(gfx, gx, h - 108 + (gfx.lineHeight(kFontBold) - moonD) / 2, moonD);
     gfx.drawText(kFontBold, gx + moonD + gap, h - 108, kWordmark);
   }
-  gfx.drawTextCentered(kFontSmall, cx, h - 56, "press power to wake");
+  renderDormantWakeHint(gfx, napping);
   return true;
 }
 
@@ -449,7 +506,7 @@ bool PrioritiesScene::renderDormantFooter(Gfx& gfx, const int y) {
   bool found = false;
   for (std::size_t i = 0; i < TODAY_STORE.count(); i++) {
     if (!TODAY_STORE.get(i, item)) continue;
-    if (strcmp(item.kind, "reminder") == 0) continue;
+    if (item.reminder) continue;
     if (!item.time[0] || strcmp(item.time, "All day") == 0) continue;
     found = true;
     break;

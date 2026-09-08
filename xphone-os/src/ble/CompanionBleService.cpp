@@ -26,10 +26,25 @@
 #include "../BlockStatusStore.h"
 #include "../ClockStore.h"
 #include "../NotificationFilter.h"
+#include "../AppsManager.h"
+#include <esp_ota_ops.h>
+#include "../scenes/AppScenes.h"
+#include "../DeviceKind.h"
+#include "../SdUpdate.h"
+
+// JSON string escaping for the inventory sender (the existing helper sits
+// in a later anonymous namespace; this one is declared early).
+static void appendJsonEscapedFree(std::string& out, const char* s) {
+  for (; *s; s++) {
+    if (*s == '"' || *s == '\\') out += '\\';
+    out += *s;
+  }
+}
 #include "../PrioritiesStore.h"
 #include "../WorkoutStore.h"
 #include "../TodayStore.h"
 #include "../net/WifiCreds.h"
+#include "../net/BleFileReceiver.h"
 #include "BleShim.h"
 #include "CompanionAncsClient.h"
 
@@ -37,6 +52,15 @@
 #include <host/ble_att.h>
 #include <host/ble_gap.h>
 #include <host/ble_hs.h>
+#if defined(CONFIG_BT_NIMBLE_ENABLED) || defined(CONFIG_NIMBLE_ENABLED)
+#include <services/gatt/ble_svc_gatt.h>
+#endif
+
+// Bump this on ANY change to the companion service's characteristics or
+// their order. Bonded phones cache the GATT table by handle; see
+// announceGattTableIfChanged(). v2 = the slow-lane characteristic
+// (2026-09-05).
+static constexpr uint32_t kGattTableVersion = 2;
 #endif
 
 namespace {
@@ -150,6 +174,20 @@ class CompanionSecurityCallbacks final : public BLESecurityCallbacks {
     }
   }
 #endif
+};
+
+class CompanionFileWriteCallbacks final : public BLECharacteristicCallbacks {
+ public:
+  explicit CompanionFileWriteCallbacks(CompanionBleService& service) : service(service) {}
+  void onWrite(BLECharacteristic* characteristic) override { service.handleFileWrite(characteristic); }
+#if defined(CONFIG_BLUEDROID_ENABLED)
+  void onWrite(BLECharacteristic* characteristic, esp_ble_gatts_cb_param_t*) override { service.handleFileWrite(characteristic); }
+#endif
+#if defined(CONFIG_NIMBLE_ENABLED)
+  void onWrite(BLECharacteristic* characteristic, ble_gap_conn_desc*) override { service.handleFileWrite(characteristic); }
+#endif
+ private:
+  CompanionBleService& service;
 };
 
 class CompanionCardWriteCallbacks final : public BLECharacteristicCallbacks {
@@ -274,7 +312,11 @@ void CompanionBleService::begin() {
       }
     };
     static CccdLogger cccdLogger;
+    // Kept in actionCccd and deleted in shutdownRadio: BLECharacteristic's
+    // destructor does not free its descriptors, so this leaked one BLE2902
+    // (two semaphores and the attr value) per resume (2026-09-07).
     auto* cccd = new (std::nothrow) BLE2902();
+    actionCccd = cccd;
     if (cccd) {
       cccd->setCallbacks(&cccdLogger);
       actionCharacteristic->addDescriptor(cccd);
@@ -283,7 +325,25 @@ void CompanionBleService::begin() {
 #endif
   actionCharacteristic->setValue("{\"schemaVersion\":1,\"type\":\"ready\"}");
 
+  // The slow-lane characteristic comes LAST. Bonded phones cache the GATT
+  // table by handle; inserting it before the action characteristic moved
+  // the notify handle and every bonded Android looped connect / subscribe
+  // fails / drop every 5 s (X4 + Moto, 2026-09-05 00:04). Appending keeps
+  // the old handles; a phone learns the new one when its cache refreshes.
+  fileCharacteristic = service->createCharacteristic(
+      CompanionProtocol::FILE_WRITE_UUID,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_WRITE_ENC);
+  static CompanionFileWriteCallbacks fileWriteCallbacks(*this);
+  if (fileCharacteristic) fileCharacteristic->setCallbacks(&fileWriteCallbacks);
+
   service->start();
+  // Once per boot, always (2026-09-07): a sync now ends in a restart, and a
+  // phone that cached the table of the previous run's Bluetooth resume finds
+  // the boot layout different ("No writable X4 characteristic", the Wi-Fi
+  // session's Finding 11). Service Changed costs the phone one rediscovery.
+  static bool announcedThisBoot = false;
+  announceGattTableIfChanged(/*force=*/!announcedThisBoot);
+  announcedThisBoot = true;
 
   advertising = BLEDevice::getAdvertising();
   // 31-byte adv packet budget: flags (3) + ANCS solicitation (18) = 21 bytes.
@@ -363,14 +423,237 @@ void CompanionBleService::tickAdvPolicy() {
   applyAdvIntervals(AdvMode::Slow);
   // If a phone connected between the checks above and this start(), start()
   // fails ("max connections") — harmless: markConnected(false) restarts
-  // advertising (back in the fast window) on the next disconnect.
-  advertising->start();
+  // advertising (back in the fast window) on the next disconnect. Any other
+  // refusal used to be silent and final; now it is logged and the watchdog
+  // (tickAdvWatchdog) retries within 5 s.
+  if (!advertising->start()) LOG_ERR("X4CMP", "adv demotion: start REFUSED by the stack (watchdog retries)");
 
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   advMode = AdvMode::Slow;
   xSemaphoreGive(stateMutex);
   LOG_INF("X4CMP", "Advertising demoted to slow interval (400-500 ms) after %lu ms fast window",
           static_cast<unsigned long>(kAdvFastWindowMs));
+}
+
+namespace {
+constexpr char kAdvWdRebootKey[] = "advwdrb";
+
+// Bonded peers in the NimBLE store; -1 when the store cannot answer.
+int bondedPeerCount() {
+#if defined(CONFIG_BT_NIMBLE_ENABLED) || defined(CONFIG_NIMBLE_ENABLED)
+  int n = 0;
+  if (ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &n) != 0) return -1;
+  return n;
+#else
+  return -1;
+#endif
+}
+
+bool advWdRebootMarkSet() {
+  Preferences pref;
+  if (!pref.begin("ble", /*readOnly=*/true)) return false;
+  const bool set = pref.getUChar(kAdvWdRebootKey, 0) != 0;
+  pref.end();
+  return set;
+}
+}  // namespace
+
+void CompanionBleService::setAdvWatchdogPeriodMin(const uint32_t minutes) {
+  if (minutes < 1 || minutes > 240) return;
+  advWdPeriodMs = minutes * 60UL * 1000UL;
+  advWdStageAtMs = millis();
+}
+
+void CompanionBleService::advWatchdogStatus(char* buf, const std::size_t n) const {
+  const uint32_t now = millis();
+  snprintf(buf, n, "period=%lumin stage=%u unseen=%lus stageAge=%lus kicks=%u rebootWanted=%d bonds=%d adv=%d",
+           static_cast<unsigned long>(advWdPeriodMs / 60000UL), advWdStage,
+           static_cast<unsigned long>(advWdStretchStartMs ? (now - advWdStretchStartMs) / 1000UL : 0),
+           static_cast<unsigned long>(advWdStretchStartMs ? (now - advWdStageAtMs) / 1000UL : 0), advWdKicks,
+           advWdRebootWanted ? 1 : 0, bondedPeerCount(), isAdvertising() ? 1 : 0);
+}
+
+void CompanionBleService::advWatchdogRebootNow() {
+  Preferences pref;
+  if (pref.begin("ble", /*readOnly=*/false)) {
+    pref.putUChar(kAdvWdRebootKey, 1);
+    pref.end();
+  }
+  LOG_ERR("X4CMP", "adv watchdog: restarting the device (stage 3)");
+  Serial.flush();
+  delay(50);
+  esp_restart();
+}
+
+// Main loop only. See the header for the stages.
+void CompanionBleService::tickAdvWatchdog() {
+  if (!started || !advertising) {
+    advWdStretchStartMs = 0;
+    advWdStage = 0;
+    return;
+  }
+  ensureMutex();
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  const bool wanted = advertisingWanted;
+  const bool conn = connected;
+  xSemaphoreGive(stateMutex);
+  const uint32_t now = millis();
+
+  if (!wanted || conn) {
+    if (conn && !advWdMarkClearedThisLink) {
+      // A phone is here: the once-per-absence reboot mark is spent. Done
+      // here, on the main loop, not in the connect callback (host task,
+      // small stack, and NVS writes block).
+      advWdMarkClearedThisLink = true;
+      Preferences pref;
+      if (pref.begin("ble", /*readOnly=*/false)) {
+        if (pref.getUChar(kAdvWdRebootKey, 0)) pref.remove(kAdvWdRebootKey);
+        pref.end();
+      }
+    }
+    if (advWdStretchStartMs && advWdStage) {
+      LOG_INF("X4CMP", "adv watchdog: a phone is back after %lu min (stage %u); stretch over",
+              static_cast<unsigned long>((now - advWdStretchStartMs) / 60000UL), advWdStage);
+    }
+    advWdStretchStartMs = 0;
+    advWdStage = 0;
+    advWdForce = false;
+    advWdRebootWanted = false;
+    return;
+  }
+  advWdMarkClearedThisLink = false;
+  if (!advWdStretchStartMs) {
+    advWdStretchStartMs = now;
+    advWdStageAtMs = now;
+    advWdLastProbeMs = now;
+    advWdStage = 0;
+    return;
+  }
+
+  // The cheap heal, every 5 s: we want to advertise, no phone is here, and
+  // the stack says it is not advertising. That is the demotion or the
+  // post-disconnect restart having been refused. Start it; at most one try
+  // per 30 s so a host that is re-syncing does not get a log flood (its own
+  // onHostSync restarts advertising too).
+  if (static_cast<int32_t>(now - advWdLastProbeMs) >= 5000) {
+    advWdLastProbeMs = now;
+    if (!advertising->isAdvertising() && static_cast<int32_t>(now - advWdLastKickMs) >= 30000) {
+      advWdLastKickMs = now;
+      ++advWdKicks;
+      const bool ok = advertising->start();
+      LOG_INF("X4CMP", "adv watchdog: stack was not advertising; start -> %s (kick %u)",
+              ok ? "OK" : "FAILED (host not synced, or refused)", advWdKicks);
+    }
+  }
+
+  const bool due = advWdForce ||
+                   static_cast<int32_t>(now - advWdStageAtMs) >= static_cast<int32_t>(advWdPeriodMs);
+  if (!due) return;
+  advWdForce = false;
+  advWdStageAtMs = now;
+  const unsigned long unseenMin = (now - advWdStretchStartMs) / 60000UL;
+  const int bonds = bondedPeerCount();
+
+  if (advWdStage == 0) {
+    // Stage 1: a plain stop/start, back in the fast window so a phone that
+    // is nearby finds the device quickly. tickAdvPolicy demotes it again.
+    advertising->stop();
+    applyAdvIntervals(AdvMode::Fast);
+    const bool ok = advertising->start();
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    advMode = AdvMode::Fast;
+    advFastUntilMs = now + kAdvFastWindowMs;
+    xSemaphoreGive(stateMutex);
+    advWdStage = 1;
+    LOG_INF("X4CMP", "adv watchdog: no phone for %lu min (bonds=%d); advertising restarted -> %s (stage 1)", unseenMin,
+            bonds, ok ? "OK" : "FAILED");
+    return;
+  }
+  if (advWdStage == 1) {
+    advWdStage = 2;
+    if (bonds == 0) {
+      LOG_INF("X4CMP", "adv watchdog: still no phone after %lu min, but no bonded phone; controller left alone (stage 2 skipped)",
+              unseenMin);
+      return;
+    }
+    // Stage 2: the software equivalent of a chip reset for the radio. The
+    // reader suspends and resumes the whole stack this way on every book,
+    // so the path is well worn. No link is open (we are unseen), so
+    // shutdownRadio's terminate/wait is a no-op.
+    LOG_INF("X4CMP", "adv watchdog: still no phone after %lu min; cycling the Bluetooth controller (stage 2)", unseenMin);
+    const uint32_t stretchStart = advWdStretchStartMs;
+    shutdownRadio(/*releaseMemory=*/false, "adv watchdog");
+    begin();  // ends in startAdvertising(), which logs "Advertising start -> OK/FAILED"
+    COMPANION_ANCS.rearmAfterRadioResume();
+    advWdStretchStartMs = stretchStart;  // the absence continues; keep counting from its start
+    advWdStageAtMs = millis();
+    advWdStage = 2;
+    LOG_INF("X4CMP", "adv watchdog: controller cycled; started=%d heap=%u", started ? 1 : 0, ESP.getFreeHeap());
+    return;
+  }
+  if (advWdStage == 2) {
+    advWdStage = 3;
+    if (bonds == 0) return;
+    if (advWdRebootMarkSet()) {
+      LOG_INF("X4CMP", "adv watchdog: still no phone after %lu min; already rebooted once for this absence, no second reboot (stage 3 skipped)",
+              unseenMin);
+      return;
+    }
+    // Stage 3: ask for a reboot. main.cpp takes it only from an idle screen
+    // (not the reader, not a transfer) and calls advWatchdogRebootNow().
+    advWdRebootWanted = true;
+    LOG_INF("X4CMP", "adv watchdog: still no phone after %lu min; asking for a reboot from an idle screen (stage 3)", unseenMin);
+    return;
+  }
+  // Stage 3 and later: only the free restart, once per period.
+  advertising->stop();
+  const bool ok = advertising->start();
+  LOG_INF("X4CMP", "adv watchdog: %lu min unseen; advertising restarted again -> %s (stage %u)", unseenMin,
+          ok ? "OK" : "FAILED", advWdStage);
+}
+
+// A bonded phone keeps the device's GATT table cached and never re-reads it
+// on its own. After a firmware update that changed the table it writes to
+// stale handles (iOS: no way to refresh but a re-pair; Android: a hidden
+// refresh call). The fix is the standard one: the Service Changed
+// indication. NimBLE marks every bonded peer's Service Changed subscription
+// as "changed while away" (persisted with the bond) and sends the indication
+// on that peer's next connection; iOS and Android then re-discover. Once per
+// table version, remembered in NVS, so a normal boot does nothing.
+void CompanionBleService::announceGattTableIfChanged(const bool force) {
+#if defined(CONFIG_BT_NIMBLE_ENABLED) || defined(CONFIG_NIMBLE_ENABLED)
+  Preferences pref;
+  if (!pref.begin("ble", /*readOnly=*/false)) return;
+  const uint32_t seen = pref.getUInt("gattv", 0);
+  if (force || seen != kGattTableVersion) {
+    ble_svc_gatt_changed(0x0001, 0xffff);
+    pref.putUInt("gattv", kGattTableVersion);
+    LOG_INF("X4CMP", "GATT table v%u (was v%u): bonded phones get Service Changed on their next connection",
+            static_cast<unsigned>(kGattTableVersion), static_cast<unsigned>(seen));
+  }
+  pref.end();
+#endif
+}
+
+void CompanionBleService::requestLaneLink(const bool fast) {
+  const uint16_t handle = secConnHandle;
+  if (handle == 0xFFFF) return;
+  if (!fast) {
+    // Back to the low-duty set, but only where it was in force: the ANCS
+    // client (iOS) asks for it again through its own one-shot path. Android
+    // chose its own parameters and keeps them.
+    if (COMPANION_ANCS.isAncsReady()) COMPANION_ANCS.rearmConnParams();
+    return;
+  }
+  ble_gap_upd_params params = {};
+  params.itvl_min = 12;               // 15 ms (1.25 ms units)
+  params.itvl_max = 24;               // 30 ms
+  params.latency = 0;
+  params.supervision_timeout = 500;   // 5 s: > 30 ms * 1 * 3 and within Apple's 2-6 s
+  params.min_ce_len = 0;
+  params.max_ce_len = 0;
+  const int rc = ble_gap_update_params(handle, &params);
+  LOG_INF("X4CMP", "slow lane: fast link requested (15-30 ms, latency 0) rc=%d", rc);
 }
 
 void CompanionBleService::startAdvertising() {
@@ -398,14 +681,44 @@ void CompanionBleService::stopAdvertising() {
   setStatus(connected ? "Connected" : "Not advertising");
 }
 
-void CompanionBleService::shutdownForTransfer() { shutdownRadio(/*releaseMemory=*/true, "File Transfer"); }
+// No-restart transfer exit (2026-09-04): the stack stops but keeps the
+// controller's reserved region (release=0), exactly like the reader's
+// suspend, so resumeAfterTransfer() can bring it back. Bench A/B lever:
+// 'xferkeepbt off' restores the old one-way release (then the session can
+// only end in a reboot). Measured: keeping the region costs ~1.5 KB of
+// transfer-mode heap; Wi-Fi + HTTP + a 5 MB upload still fit (X4, x3mem).
+bool gTransferKeepBt = true;
+void CompanionBleService::shutdownForTransfer() {
+  shutdownRadio(/*releaseMemory=*/!gTransferKeepBt, "File Transfer");
+  Serial.printf("[xphone-os] transfer: after BLE shutdown (keepBt=%d) heap=%u largest=%u\n", gTransferKeepBt ? 1 : 0,
+                ESP.getFreeHeap(), static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+}
+
+void CompanionBleService::queueTransferStatus(const char* state, const char* detail) {
+  ensureMutex();
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  snprintf(pendingTransferState, sizeof(pendingTransferState), "%s", state ? state : "");
+  snprintf(pendingTransferDetail, sizeof(pendingTransferDetail), "%s", detail ? detail : "");
+  xSemaphoreGive(stateMutex);
+}
+
+void CompanionBleService::resumeAfterTransfer(const char* pendingState, const char* pendingDetail) {
+  ensureMutex();
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  snprintf(pendingTransferState, sizeof(pendingTransferState), "%s", pendingState ? pendingState : "");
+  snprintf(pendingTransferDetail, sizeof(pendingTransferDetail), "%s", pendingDetail ? pendingDetail : "");
+  xSemaphoreGive(stateMutex);
+  resumeAfterReader();
+  Serial.printf("[xphone-os] transfer: after BLE resume heap=%u largest=%u started=%d\n", ESP.getFreeHeap(),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)), started ? 1 : 0);
+}
 
 void CompanionBleService::suspendForReader() {
   shutdownRadio(/*releaseMemory=*/false, "Reading");
   releaseReaderTransients();
 }
 
-void CompanionBleService::releaseReaderTransients() {
+void CompanionBleService::releaseReaderTransients(bool radioUp) {
   // The reader is about to claim one contiguous 32 KB inflate window from
   // the plain that deinit just returned. Any heap block this service still
   // owns from the connected era sits INSIDE that plain and splits it —
@@ -429,8 +742,10 @@ void CompanionBleService::releaseReaderTransients() {
   for (auto& p : pendingPayloads) std::string().swap(p);
   pendingHead = 0;
   pendingCount = 0;
-  std::string().swap(statusMessage);
-  statusMessage = "Bluetooth off";  // 13 chars: small-string optimized, no heap
+  if (!radioUp) {
+    std::string().swap(statusMessage);
+    statusMessage = "Bluetooth off";  // 13 chars: small-string optimized, no heap
+  }
   ++revision;
   xSemaphoreGive(stateMutex);
 }
@@ -517,11 +832,12 @@ void CompanionBleService::shutdownRadio(const bool releaseMemory, const char* re
   // next 60 s stats tick dereferences a deleted TCB (observed load fault).
   COMPANION_ANCS.clearHostTaskHandle();
 
-  // releaseMemory=true (File Transfer): controller + host memory returned
-  // to the heap; BLE can't come back until reboot — the transfer session
-  // ends in esp_restart(), so that is the designed path.
-  // releaseMemory=false (Reader): stack stops but stays re-initializable;
-  // resumeAfterReader() brings it back without a reboot.
+  // releaseMemory=true: controller + host memory returned to the heap for
+  // good; BLE can't come back until reboot. Bench-only since 2026-09-04
+  // ('xferkeepbt off'): on the C3 it returns only ~1 KB anyway.
+  // releaseMemory=false (Reader, File Transfer): stack stops but stays
+  // re-initializable; resumeAfterReader()/resumeAfterTransfer() bring it
+  // back without a reboot.
   BLEDevice::deinit(releaseMemory);
 
   xSemaphoreTake(stateMutex, portMAX_DELAY);
@@ -549,11 +865,49 @@ void CompanionBleService::shutdownRadio(const bool releaseMemory, const char* re
   cardCharacteristic = nullptr;
   delete actionCharacteristic;
   actionCharacteristic = nullptr;
+  delete actionCccd;  // after its characteristic: nothing references it any more
+  actionCccd = nullptr;
+  delete fileCharacteristic;
+  fileCharacteristic = nullptr;
   delete gattService;
   gattService = nullptr;
 
   LOG_INF("X4CMP", "BLE shutdown done: heap now %u", ESP.getFreeHeap());
 }
+
+bool CompanionBleService::takeTransferTarget(char* ssid, size_t ssidSize, char* pass, size_t passSize) {
+  ensureMutex();
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  const bool has = transferTargetSsid[0] != '\0';
+  snprintf(ssid, ssidSize, "%s", transferTargetSsid);
+  snprintf(pass, passSize, "%s", transferTargetPass);
+  transferTargetSsid[0] = '\0';
+  transferTargetPass[0] = '\0';
+  xSemaphoreGive(stateMutex);
+  return has;
+}
+
+void CompanionBleService::setTransferTarget(const char* ssid, const char* pass) {
+  ensureMutex();
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  snprintf(transferTargetSsid, sizeof(transferTargetSsid), "%s", ssid ? ssid : "");
+  snprintf(transferTargetPass, sizeof(transferTargetPass), "%s", pass ? pass : "");
+  xSemaphoreGive(stateMutex);
+}
+
+void CompanionBleService::dropLinks() {
+  int n = 0;
+  for (uint16_t h = 0; h < 16; ++h) {
+    struct ble_gap_conn_desc d;
+    if (ble_gap_conn_find(h, &d) == 0) {
+      ble_gap_terminate(h, BLE_ERR_REM_USER_CONN_TERM);
+      ++n;
+    }
+  }
+  LOG_INF("X4CMP", "bledrop: terminated %d link(s)", n);
+}
+
+bool CompanionBleService::isAdvertising() const { return advertising != nullptr && advertising->isAdvertising(); }
 
 bool CompanionBleService::isConnected() const {
   ensureMutex();
@@ -640,13 +994,24 @@ void CompanionBleService::markConnected(bool value) {
       // Connected: stay findable, but at the SLOW interval. A phone that
       // is already here does not need a fast window, and holding fast
       // advertising for the whole of a connection is pure battery.
-      LOG_INF("X4CMP", "BLE connected; still advertising for a second phone");
+      if (!advWhileConnected && advertising) {
+        advertising->stop();
+        LOG_INF("X4CMP", "BLE connected; advertising stopped (advconn off)");
+      } else {
+        LOG_INF("X4CMP", "BLE connected; still advertising for a second phone");
+      }
       applyAdvIntervals(AdvMode::Slow);
       xSemaphoreTake(stateMutex, portMAX_DELAY);
       advMode = AdvMode::Slow;
       xSemaphoreGive(stateMutex);
     }
-    BLEDevice::startAdvertising();
+    // Was BLEDevice::startAdvertising(), which drops the result. The 2026-09-06
+    // latch (X3, two hours invisible after a disconnect) left no line here
+    // because a refusal was never logged. Log it; the watchdog retries.
+    if (advertising && !advertising->start()) {
+      LOG_ERR("X4CMP", "Advertising restart after %s REFUSED by the stack (watchdog retries)",
+              value ? "connect" : "disconnect");
+    }
   }
 }
 
@@ -816,7 +1181,37 @@ void CompanionBleService::handleCardWrite(BLECharacteristic* characteristic) {
   xSemaphoreGive(stateMutex);
 }
 
+void CompanionBleService::handleFileWrite(BLECharacteristic* characteristic) {
+  if (!characteristic) return;
+  String value = characteristic->getValue();
+  if (!BleFileReceiver::enqueue(reinterpret_cast<const uint8_t*>(value.c_str()), value.length())) {
+    // Full queue or no book in progress: give the main loop a moment; the
+    // write is acked by the stack either way and the CRC at the end tells.
+    delay(20);
+    if (!BleFileReceiver::enqueue(reinterpret_cast<const uint8_t*>(value.c_str()), value.length())) {
+      BleFileReceiver::markGap();
+      Serial.println("[xphone-os] ble-file: frame dropped (queue full twice)");
+    }
+  }
+}
+
 void CompanionBleService::processPending() {
+  // The slow lane: card frames onto the SD from the main loop. Every drain
+  // that wrote something answers with "received": that is the phone's
+  // credit. Frames come without a response and the phone keeps at most
+  // one queue (6 frames) in flight, so the queue never overflows and the
+  // link never idles for a per-frame round trip (15 KB/s before, bench
+  // 2026-09-05).
+  if (BleFileReceiver::active()) {
+    const size_t wrote = BleFileReceiver::drain();
+    if (wrote > 0 && actionCharacteristic && isConnected()) {
+      char json[96];
+      snprintf(json, sizeof(json), "{\"schemaVersion\":1,\"type\":\"book.progress\",\"received\":%lu}",
+               static_cast<unsigned long>(BleFileReceiver::received()));
+      actionCharacteristic->setValue(json);
+      notifyAction();
+    }
+  }
   // Drain the whole FIFO in arrival order — parts of a split snapshot must
   // all land in the same wake of the loop when they queued together.
   ensureMutex();
@@ -925,6 +1320,17 @@ bool CompanionBleService::applyCardPayload(const std::string& payload) {
     return true;
   }
   if (std::strcmp(type, "reader.progress.request") == 0) {
+    // Storm guard (2026-09-06, X4 bench): an iPhone re-requested progress on
+    // every out-of-order chunk and the device answered each one, 300 replies
+    // of 3.8 KB in three minutes. One reply per two seconds is plenty; the
+    // phone's own re-request limit is five seconds.
+    static uint32_t sLastProgressReqMs = 0;
+    const uint32_t now = millis();
+    if (sLastProgressReqMs && now - sLastProgressReqMs < 2000) {
+      Serial.println("[xphone-os] ble: reader.progress.request within 2 s of the last; dropped");
+      return true;
+    }
+    sLastProgressReqMs = now;
     progressRequested = true;
     return true;
   }
@@ -1027,9 +1433,57 @@ bool CompanionBleService::applyCardPayload(const std::string& payload) {
         pref.end();
       }
     }
+    // Same slot for the no-restart exit's queued "stopped" (2026-09-04):
+    // the session ended with Wi-Fi torn down and BLE brought back; tell
+    // the phone now that it is listening again.
+    {
+      char st[sizeof(pendingTransferState)];
+      char dt[sizeof(pendingTransferDetail)];
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      snprintf(st, sizeof(st), "%s", pendingTransferState);
+      snprintf(dt, sizeof(dt), "%s", pendingTransferDetail);
+      pendingTransferState[0] = '\0';
+      pendingTransferDetail[0] = '\0';
+      xSemaphoreGive(stateMutex);
+      if (st[0]) sendTransferStatus(st, nullptr, dt);
+    }
+    return true;
+  }
+  if (std::strcmp(type, "book.begin") == 0) {
+    const char* name = doc["name"] | "";
+    const uint32_t size = doc["size"] | 0UL;
+    const uint32_t crc = doc["crc32"] | 0UL;
+    const bool ok = BleFileReceiver::begin(name, size, crc);
+    if (!ok && actionCharacteristic) {
+      actionCharacteristic->setValue("{\"schemaVersion\":1,\"type\":\"book.done\",\"ok\":false,\"reason\":\"cannot start\"}");
+      notifyAction();
+    }
+    if (ok) requestLaneLink(/*fast=*/true);
+    return true;
+  }
+  if (std::strcmp(type, "book.end") == 0) {
+    char reason[64];
+    const bool ok = BleFileReceiver::end(reason, sizeof(reason));
+    if (actionCharacteristic) {
+      char json[200];
+      snprintf(json, sizeof(json), "{\"schemaVersion\":1,\"type\":\"book.done\",\"ok\":%s,\"reason\":\"%s\"}",
+               ok ? "true" : "false", reason);
+      actionCharacteristic->setValue(json);
+      notifyAction();
+    }
+    if (ok) shelfRequested = true;
+    requestLaneLink(/*fast=*/false);
     return true;
   }
   if (std::strcmp(type, "transfer.start") == 0) {
+    // "ssid": the network the PHONE is on right now; the device joins that
+    // one only, and raises its hotspot when it cannot (2026-09-04 rule).
+    // "pass": present only for the phone-hotspot rung (a session-only
+    // network the device has never saved). Absent = the old saved-list walk.
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    snprintf(transferTargetSsid, sizeof(transferTargetSsid), "%s", doc["ssid"] | "");
+    snprintf(transferTargetPass, sizeof(transferTargetPass), "%s", doc["pass"] | "");
+    xSemaphoreGive(stateMutex);
     transferRequest = TransferRequest::Start;
     return true;
   }
@@ -1053,7 +1507,7 @@ bool CompanionBleService::applyCardPayload(const std::string& payload) {
   if (std::strcmp(type, "transfer.wifi") == 0) {
     // Wi-Fi credentials for File Transfer STA mode, provisioned over the
     // encrypted BLE link into NVS (the device has no keyboard). W1: this
-    // ADDS to the multi-network store and marks the network preferred.
+    // ADDS to the multi-network store (tried first in the store walk).
     const char* ssid = doc["ssid"] | "";
     const char* password = doc["password"] | "";
     const bool ok = WifiCreds::save(ssid, password);
@@ -1086,6 +1540,18 @@ bool CompanionBleService::applyCardPayload(const std::string& payload) {
     placePushPending = true;
     return true;
   }
+  if (std::strcmp(type, "reader.goto") == 0) {
+    // X1: the phone asks the device to turn to a paragraph. Latched like
+    // reader.place; the main loop owns the scene rules (same book = live
+    // jump, anything else = a confirm on the glass first).
+    const char* key = doc["key"] | "";
+    const uint32_t cid = doc["cid"] | 0;
+    if (key[0] == '\0' || cid == 0) return false;
+    snprintf(pendingGoto.key, sizeof(pendingGoto.key), "%s", key);
+    pendingGoto.cid = cid;
+    gotoPushPending = true;
+    return true;
+  }
   if (std::strcmp(type, "wifi.replaceAll") == 0) {
     // The phone's whole vault in one push (share once, every device knows).
     WifiCreds::Network nets[WifiCreds::kMaxNetworks];
@@ -1106,6 +1572,9 @@ bool CompanionBleService::applyCardPayload(const std::string& payload) {
     wifiKnownRequested = true;
     return true;
   }
+  // Phase 3: home arrangement + app install/remove/inventory cards.
+  // Runs on the main loop like the store captures below.
+  if (apps_mgr::handleCard(doc.as<JsonObjectConst>(), type)) return true;
 
   auto* next = new (std::nothrow) CompanionCardState();
   if (!next) {
@@ -1123,8 +1592,6 @@ bool CompanionBleService::applyCardPayload(const std::string& payload) {
   next->todayWeather = clippedString(doc["weather"] | "", CompanionProtocol::MAX_TITLE_CHARS);
   next->todayHighLow = clippedString(doc["highLow"] | "", CompanionProtocol::MAX_TITLE_CHARS);
   next->todaySync = clippedString(doc["sync"] | "", CompanionProtocol::MAX_TITLE_CHARS);
-  next->mailSource = clippedString(doc["mailSource"] | "", CompanionProtocol::MAX_SOURCE_CHARS);
-  next->mailSync = clippedString(doc["mailSync"] | "", CompanionProtocol::MAX_TITLE_CHARS);
   next->endsAtLabel = clippedString(doc["endsAtLabel"] | "", CompanionProtocol::MAX_TODAY_FIELD_CHARS);
   next->part = doc["part"] | 0;
   next->parts = doc["parts"] | 1;
@@ -1133,6 +1600,7 @@ bool CompanionBleService::applyCardPayload(const std::string& payload) {
   next->blocksToday = doc["blocksToday"] | 0;
   next->blockStreak = doc["blockStreak"] | 0;
   next->blocksTotal = doc["blocksTotal"] | 0;
+  next->blockMinutesToday = doc["blockMinutesToday"] | 0;
 
   JsonObject source = doc["source"].as<JsonObject>();
   if (!source.isNull()) {
@@ -1177,28 +1645,7 @@ bool CompanionBleService::applyCardPayload(const std::string& payload) {
     }
   }
 
-  JsonArray mailItems = doc["mailItems"].as<JsonArray>();
-  for (JsonVariant item : mailItems) {
-    if (next->mailItemCount >= CompanionProtocol::MAX_MAIL_ITEMS) break;
-    auto& target = next->mailItems[next->mailItemCount++];
-    if (item.is<JsonArray>()) {
-      JsonArray fields = item.as<JsonArray>();
-      target.id = clippedString(fields[0] | "", CompanionProtocol::MAX_ID_CHARS);
-      target.from = clippedString(fields[1] | "", CompanionProtocol::MAX_SOURCE_CHARS);
-      target.subject = clippedString(fields[2] | "", CompanionProtocol::MAX_TITLE_CHARS);
-      target.preview = clippedString(fields[3] | "", CompanionProtocol::MAX_MAIL_FIELD_CHARS);
-      target.time = clippedString(fields[4] | "", CompanionProtocol::MAX_TODAY_FIELD_CHARS);
-      target.state = clippedString(fields[5] | "", CompanionProtocol::MAX_ID_CHARS);
-    } else if (item.is<JsonObject>()) {
-      JsonObject fields = item.as<JsonObject>();
-      target.id = clippedString(fields["id"] | "", CompanionProtocol::MAX_ID_CHARS);
-      target.from = clippedString(fields["from"] | "", CompanionProtocol::MAX_SOURCE_CHARS);
-      target.subject = clippedString(fields["subject"] | "", CompanionProtocol::MAX_TITLE_CHARS);
-      target.preview = clippedString(fields["preview"] | "", CompanionProtocol::MAX_MAIL_FIELD_CHARS);
-      target.time = clippedString(fields["time"] | "", CompanionProtocol::MAX_TODAY_FIELD_CHARS);
-      target.state = clippedString(fields["state"] | "", CompanionProtocol::MAX_ID_CHARS);
-    }
-  }
+  // mailItems: no longer parsed (nothing read it).
 
   // M3 Priorities — the iOS PrioritiesManager sends priorityItems as
   // 4-element arrays [id, title, note, done] (PrioritiesManager.swift:
@@ -1289,10 +1736,10 @@ bool CompanionBleService::applyCardPayload(const std::string& payload) {
   ++revision;
   xSemaphoreGive(stateMutex);
 
-  LOG_INF("X4CMP", "Card received id=%s source=%s titleBytes=%u bodyBytes=%u actions=%u today=%u mail=%u prio=%u",
+  LOG_INF("X4CMP", "Card received id=%s source=%s titleBytes=%u bodyBytes=%u actions=%u today=%u prio=%u",
           next->id.c_str(), next->source.c_str(), static_cast<unsigned>(next->title.size()),
           static_cast<unsigned>(next->body.size()), static_cast<unsigned>(next->actionCount),
-          static_cast<unsigned>(next->todayItemCount), static_cast<unsigned>(next->mailItemCount),
+          static_cast<unsigned>(next->todayItemCount),
           static_cast<unsigned>(next->priorityItemCount));
   delete next;
   return true;
@@ -1491,12 +1938,16 @@ bool CompanionBleService::consumeShelfRequest() {
 }
 
 bool CompanionBleService::consumeProgressRequest() {
+  // A deferred send (MTU not exchanged yet) waits its retry delay.
+  if (progressRetryAtMs && static_cast<int32_t>(millis() - progressRetryAtMs) < 0) return false;
+  progressRetryAtMs = 0;
   const bool was = progressRequested;
   progressRequested = false;
   return was;
 }
 
 bool CompanionBleService::consumeWifiKnownRequest() {
+  if (progressRetryAtMs && static_cast<int32_t>(millis() - progressRetryAtMs) < 0) return false;
   const bool was = wifiKnownRequested;
   wifiKnownRequested = false;
   return was;
@@ -1552,6 +2003,33 @@ void CompanionBleService::sendWifiKnown() {
   }
   payload += ']';
   {
+    // F4 (2026-09-04): the same networks with signal, security and
+    // channel, strongest first. Old apps ignore the field.
+    char scan[512];
+    WifiCreds::loadScan(scan, sizeof(scan));
+    payload += ",\"scan\":[";
+    bool first = true;
+    for (char* line = strtok(scan, "\n"); line; line = strtok(nullptr, "\n")) {
+      char* f1 = strchr(line, '\t');
+      if (!f1) continue;
+      *f1++ = '\0';
+      char* f2 = strchr(f1, '\t');
+      if (!f2) continue;
+      *f2++ = '\0';
+      char* f3 = strchr(f2, '\t');
+      if (!f3) continue;
+      *f3++ = '\0';
+      if (!first) payload += ',';
+      first = false;
+      payload += "{\"s\":\"";
+      appendJsonEscaped(payload, line);
+      char num[48];
+      snprintf(num, sizeof(num), "\",\"r\":%d,\"a\":%d,\"c\":%d}", atoi(f1), atoi(f2), atoi(f3));
+      payload += num;
+    }
+    payload += ']';
+  }
+  {
     // W2: the hotspot identity rides along, encrypted end to end. The
     // phone stores it and can join the device's AP with zero typing.
     char apSsid[33], apPass[17];
@@ -1587,7 +2065,16 @@ void CompanionBleService::sendWifiKnown() {
 #endif
   const size_t chunkBudget = static_cast<size_t>(mtu) - 3;
   constexpr size_t kEnvelopeOverhead = 96;
-  const size_t bodyBudget = chunkBudget > kEnvelopeOverhead ? chunkBudget - kEnvelopeOverhead : 32;
+  if (chunkBudget < kEnvelopeOverhead + 16) {
+    // MTU still 23 (see sendReaderProgress): keep the request, retry later.
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    wifiKnownRequested = true;
+    progressRetryAtMs = millis() + 1000;
+    xSemaphoreGive(stateMutex);
+    Serial.printf("[xphone-os] ble: wifi.known deferred (mtu %u)\n", static_cast<unsigned>(mtu));
+    return;
+  }
+  const size_t bodyBudget = chunkBudget - kEnvelopeOverhead;
   const uint32_t token = millis();
   uint16_t seq = 0;
   size_t sent = 0;
@@ -1633,6 +2120,19 @@ bool CompanionBleService::consumePlacePush(PlacePush& out) {
   out = pendingPlace;
   placePushPending = false;
   return true;
+}
+
+bool CompanionBleService::consumeGotoPush(GotoPush& out) {
+  if (!gotoPushPending) return false;
+  out = pendingGoto;
+  gotoPushPending = false;
+  return true;
+}
+
+void CompanionBleService::benchInjectGoto(const char* key, uint32_t cid) {
+  snprintf(pendingGoto.key, sizeof(pendingGoto.key), "%s", key);
+  pendingGoto.cid = cid;
+  gotoPushPending = true;
 }
 
 void CompanionBleService::benchInjectPlace(const char* key, uint32_t page, uint32_t pageCount) {
@@ -1699,6 +2199,69 @@ void CompanionBleService::notifyAction() {
   actionCharacteristic->notify();
 }
 
+// R1: one small notify per highlight toggle, so a connected phone feels
+// it instantly; the sidecar file remains the truth the sync reads later.
+void CompanionBleService::notifyReaderHl(const char* key, uint32_t cid, uint32_t day,
+                                         bool removed) {
+  if (!isConnected() || !actionCharacteristic || !isEncrypted() || !phoneReadyForNotify) return;
+  char json[160];
+  snprintf(json, sizeof(json),
+           "{\"schemaVersion\":1,\"type\":\"reader.hl\",\"key\":\"%s\",\"cid\":%lu,"
+           "\"day\":%lu,\"removed\":%s}",
+           key, static_cast<unsigned long>(cid), static_cast<unsigned long>(day),
+           removed ? "true" : "false");
+  actionCharacteristic->setValue(json);
+  notifyAction();
+  Serial.printf("[xphone-os] hl: %s ~%lu %s\n", key, static_cast<unsigned long>(cid),
+                removed ? "removed" : "kept");
+}
+
+void CompanionBleService::queueReaderPos(const char* key, uint16_t page, uint16_t count,
+                                         uint32_t cid, uint16_t min) {
+  snprintf(posOut.key, sizeof(posOut.key), "%s", key);
+  posOut.page = page;
+  posOut.count = count;
+  posOut.cid = cid;
+  posOut.min = min;
+  posValid = true;
+  posDirty = true;
+}
+
+void CompanionBleService::clearReaderPos() {
+  posValid = false;
+  posDirty = false;
+}
+
+void CompanionBleService::pumpReaderPos() {
+  if (!posValid) return;
+  if (!isConnected() || !actionCharacteristic || !isEncrypted()) return;
+  if (!phoneReadyForNotify) return;  // same re-subscribe race as the place pump
+  const uint32_t now = millis();
+  // A held turn button fires every ~300 ms; nobody consumes intermediate
+  // positions, so one per second, last turn wins. A still page heartbeats
+  // every 5 minutes so the phone can tell "slow reader" from "gone".
+  const bool turnDue = posDirty && now - posLastSentMs >= 1000UL;
+  const bool heartbeatDue = !posDirty && now - posLastSentMs >= 300000UL;
+  if (!turnDue && !heartbeatDue) return;
+  // Minutes are computed at SEND time, not queue time: a heartbeat that
+  // repeats a 5-minute-old payload must not freeze the session clock (a
+  // slow reader's phone card would stop counting).
+  posOut.min = reader::ReadingStats::sessionMinutes();
+  char json[192];
+  snprintf(json, sizeof(json),
+           "{\"schemaVersion\":1,\"type\":\"reader.pos\",\"key\":\"%s\","
+           "\"page\":%u,\"count\":%u,\"cid\":%lu,\"min\":%u}",
+           posOut.key, static_cast<unsigned>(posOut.page), static_cast<unsigned>(posOut.count),
+           static_cast<unsigned long>(posOut.cid), static_cast<unsigned>(posOut.min));
+  actionCharacteristic->setValue(json);
+  notifyAction();
+  Serial.printf("[xphone-os] pos: %s %u/%u min=%u%s\n", posOut.key,
+                static_cast<unsigned>(posOut.page), static_cast<unsigned>(posOut.count),
+                static_cast<unsigned>(posOut.min), posDirty ? "" : " (heartbeat)");
+  posDirty = false;
+  posLastSentMs = now;
+}
+
 void CompanionBleService::pumpReaderPlace() {
   if (!outPlacePending) return;
   if (!isConnected() || !actionCharacteristic || !isEncrypted()) return;  // never over an open link
@@ -1722,6 +2285,39 @@ void CompanionBleService::pumpReaderPlace() {
                 static_cast<unsigned long>(pendingOut.page),
                 static_cast<unsigned long>(pendingOut.pageCount),
                 static_cast<unsigned long>(pendingOut.seq));
+}
+
+void CompanionBleService::sendWifiRequest() {
+  if (!isConnected() || !actionCharacteristic) return;
+  actionCharacteristic->setValue("{\"schemaVersion\":1,\"type\":\"wifi.request\"}");
+  notifyAction();
+  LOG_INF("X4CMP", "wifi.request sent");
+}
+
+void CompanionBleService::sendWifiForgot(const char* ssid) {
+  if (!isConnected() || !actionCharacteristic || !ssid) return;
+  JsonDocument doc;
+  doc["schemaVersion"] = 1;
+  doc["type"] = "wifi.forgot";
+  doc["ssid"] = ssid;
+  String json;
+  serializeJson(doc, json);
+  actionCharacteristic->setValue(json);
+  notifyAction();
+  LOG_INF("X4CMP", "wifi.forgot sent for %s", ssid);
+}
+
+void CompanionBleService::sendWifiTest(const char* ssid) {
+  if (!isConnected() || !actionCharacteristic || !ssid) return;
+  JsonDocument doc;
+  doc["schemaVersion"] = 1;
+  doc["type"] = "wifi.test";
+  doc["ssid"] = ssid;
+  String json;
+  serializeJson(doc, json);
+  actionCharacteristic->setValue(json);
+  notifyAction();
+  LOG_INF("X4CMP", "wifi.test sent for %s", ssid);
 }
 
 void CompanionBleService::sendTransferStatus(const char* state, const char* ip, const char* detail) {
@@ -1772,9 +2368,22 @@ void CompanionBleService::sendReaderProgress() {
   }
 #endif
   const size_t chunkBudget = static_cast<size_t>(mtu) - 3;
-  // {"schemaVersion":1,"type":"reader.progress","tok":4294967295,"seq":999,"done":false,"d":"..."}
-  constexpr size_t kEnvelopeOverhead = 96;
-  const size_t bodyBudget = chunkBudget > kEnvelopeOverhead ? chunkBudget - kEnvelopeOverhead : 32;
+  // {"schemaVersion":1,"type":"reader.progress","tok":4294967295,"seq":999,"done":false,"len":65535,"d":"..."}
+  constexpr size_t kEnvelopeOverhead = 108;
+  if (chunkBudget < kEnvelopeOverhead + 16) {
+    // The MTU is still the 23-byte default (the phone asked before the
+    // exchange landed). The old ":32" fallback then emitted ~125-byte
+    // notifies onto a 20-byte ATT payload: NimBLE truncates, the phone
+    // gets a hole, and its stats silently stop updating (transfer scope,
+    // 2026-09-03). Keep the request and answer once the MTU is real.
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    progressRequested = true;
+    progressRetryAtMs = millis() + 1000;
+    xSemaphoreGive(stateMutex);
+    Serial.printf("[xphone-os] ble: reader.progress deferred (mtu %u)\n", static_cast<unsigned>(mtu));
+    return;
+  }
+  const size_t bodyBudget = chunkBudget - kEnvelopeOverhead;
 
   const uint32_t token = millis();
   uint16_t seq = 0;
@@ -1799,11 +2408,13 @@ void CompanionBleService::sendReaderProgress() {
       if (c == '"' || c == '\\') escaped += '\\';
       escaped += c;
     }
+    // "len": the whole payload's byte count, so the phone can tell a
+    // complete reassembly from one with a hole before it parses.
     snprintf(json, sizeof(json),
              "{\"schemaVersion\":1,\"type\":\"reader.progress\",\"tok\":%lu,\"seq\":%u,"
-             "\"done\":%s,\"d\":\"%s\"}",
+             "\"done\":%s,\"len\":%u,\"d\":\"%s\"}",
              static_cast<unsigned long>(token), static_cast<unsigned>(seq),
-             done ? "true" : "false", escaped.c_str());
+             done ? "true" : "false", static_cast<unsigned>(payload.size()), escaped.c_str());
     actionCharacteristic->setValue(json);
     notifyAction();
     seq++;
@@ -1875,8 +2486,18 @@ void CompanionBleService::sendReaderShelf() {
         // .fbp: bookc packages — ReaderScene lists them, so the shelf must too
         // or device-loaded FBP books are invisible to the companion apps.
         const bool isFbp = len >= 4 && strcasecmp(name + len - 4, ".fbp") == 0;
-        const bool eligible = got > 0 && got < sizeof(name) && !f.isDir() &&
-                              name[0] != '.' && (isEpub || isTxt || isFbp);
+        bool eligible = got > 0 && got < sizeof(name) && !f.isDir() &&
+                        name[0] != '.' && (isEpub || isTxt || isFbp);
+        // A package the card cannot read is not a book (2026-09-07): the Wi-Fi
+        // listing skips it, and this list must agree, or the phone keeps
+        // queueing a copy of it that dies as "network connection was lost".
+        if (eligible && isFbp) {
+          uint8_t magic[4] = {0};
+          if (f.read(magic, 4) != 4 || std::memcmp(magic, "FBPK", 4) != 0) {
+            eligible = false;
+            Serial.printf("[xphone-os] ble: shelf skips unreadable package '%s'\n", name);
+          }
+        }
         // A source and its package are ONE book. ReaderScene::scanDir hides an
         // .epub whose .fbp sits beside it, and this list has to agree with it:
         // on 2026-08-21 the X4 reported 27 books here while its own shelf drew
@@ -1901,6 +2522,16 @@ void CompanionBleService::sendReaderShelf() {
           JsonArray entry = entryDoc.to<JsonArray>();
           entry.add(name);
           entry.add(static_cast<uint32_t>(f.fileSize()));
+          // Third element, only when true: the reader's "Mark finished" left
+          // "<book>.done" beside the package (C4). The phones fold it as the
+          // whole book read and shelve it under Finished without a Wi-Fi
+          // listing (Andrew, 2026-09-06: "Done shelf on the phones now").
+          // Old apps read [0] and [1] only, so the extra element is safe.
+          {
+            char side[128];
+            const int sn = snprintf(side, sizeof(side), "/books/%s.done", name);
+            if (sn > 0 && sn < static_cast<int>(sizeof(side)) && SdMan.exists(side)) entry.add(1);
+          }
           String piece;
           serializeJson(entryDoc, piece);
           if (!books.isEmpty() && books.length() + 1 + piece.length() > booksBudget) {
@@ -1921,6 +2552,87 @@ void CompanionBleService::sendReaderShelf() {
 
   sendChunk(true);  // final chunk carries done=true (and any remaining books)
   LOG_INF("X4CMP", "Reader shelf sent: %d book(s), %u chunk(s), mtu=%u", count, static_cast<unsigned>(seq), mtu);
+}
+
+void CompanionBleService::sendDeviceInfo() {
+  if (!isConnected() || !actionCharacteristic) return;
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  char json[300];
+  std::snprintf(json, sizeof(json),
+                "{\"schemaVersion\":1,\"type\":\"device.info\",\"version\":\"%s\",\"gitRev\":\"%s\","
+                "\"device\":\"%s\",\"slot\":\"%s\",\"otaPending\":%s}",
+                XPHONE_VERSION, XPHONE_GIT_REV_STR, gDeviceIsX3 ? "x3" : "x4",
+                running ? running->label : "?", sd_update::otaPending() ? "true" : "false");
+  actionCharacteristic->setValue(json);
+  notifyAction();
+  LOG_INF("X4CMP", "device.info sent: %s", XPHONE_VERSION);
+}
+
+void CompanionBleService::sendAppsInventory() {
+  if (!isConnected() || !actionCharacteristic) return;
+
+  // Collect first (at most 16 entries, ~1 KB), then chunk exactly like
+  // notif.apps: every notify must fit one ATT payload.
+  std::string entries[16];
+  std::size_t entryCount = 0;
+  struct Ctx {
+    std::string* entries;
+    std::size_t* count;
+  } ctx{entries, &entryCount};
+  apps_mgr::forEachInstalledApp(
+      [](const char* name, const char* title, void* vctx) {
+        Ctx* c = static_cast<Ctx*>(vctx);
+        if (*c->count >= 16) return;
+        std::string& e = c->entries[*c->count];
+        e = "{\"name\":\"";
+        appendJsonEscapedFree(e, name);
+        e += "\",\"title\":\"";
+        appendJsonEscapedFree(e, title);
+        e += "\"}";
+        ++*c->count;
+      },
+      &ctx);
+
+  uint16_t mtu = 185;
+#if defined(CONFIG_NIMBLE_ENABLED)
+  ensureMutex();
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  const uint16_t connHandle = secConnHandle;
+  xSemaphoreGive(stateMutex);
+  if (connHandle != 0xffff) {
+    const uint16_t live = ble_att_mtu(connHandle);
+    if (live >= 23) mtu = live;
+  }
+#endif
+  const std::size_t chunkBudget = static_cast<std::size_t>(mtu) - 3;
+  constexpr std::size_t kEnvelopeOverhead = 100;
+  const std::size_t appsBudget = chunkBudget > kEnvelopeOverhead ? chunkBudget - kEnvelopeOverhead : 0;
+  const uint32_t token = millis();
+  uint16_t sequence = 0;
+  std::string appsJson;
+
+  auto sendChunk = [&](const bool done) {
+    char json[560];
+    std::snprintf(json, sizeof(json),
+                  "{\"schemaVersion\":1,\"type\":\"device.apps\",\"tok\":%lu,\"seq\":%u,\"done\":%s,\"apps\":[%s]}",
+                  static_cast<unsigned long>(token), static_cast<unsigned>(sequence), done ? "true" : "false",
+                  appsJson.c_str());
+    actionCharacteristic->setValue(json);
+    notifyAction();
+    ++sequence;
+    appsJson.clear();
+    delay(20);
+  };
+
+  for (std::size_t i = 0; i < entryCount; ++i) {
+    const std::size_t need = entries[i].size() + (appsJson.empty() ? 0 : 1);
+    if (!appsJson.empty() && appsJson.size() + need > appsBudget) sendChunk(false);
+    if (!appsJson.empty()) appsJson += ',';
+    appsJson += entries[i];
+  }
+  sendChunk(true);
+  LOG_INF("X4CMP", "device.apps sent: %u apps in %u chunks", static_cast<unsigned>(entryCount),
+          static_cast<unsigned>(sequence));
 }
 
 void CompanionBleService::sendNotifApps() {

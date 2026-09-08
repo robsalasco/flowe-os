@@ -12,16 +12,18 @@
 #include "../art/LauncherIcons.h"
 #include "../ble/CompanionBleService.h"
 #include "AppScenes.h"
+#include "HomeScene.h"
+
+#include <SDCardManager.h>
+#include <ArduinoJson.h>
 
 namespace {
 
-// Six focus apps in a 3×2 grid, ordered by likelihood of use (Today first —
-// it is also the boot selection). Settings opens from BACK; About is in
-// Settings. Icon bitmaps come from IconStyle (Settings → Icon style packs);
-// the XPhoneIconPacks columns in LauncherIcons.h share this order.
-constexpr const char* kApps[LauncherScene::APP_COUNT] = {
-    "Today", "Notifications", "Priorities", "Block", "Read", "Workout",
-};
+// Six slots in a 3x2 grid. What fills them comes from NVS (Phase 3
+// "homeSlots"): the six builtins by default, or installed apps in any
+// slot. See loadSlots(). Icon bitmaps come from IconStyle (Settings ->
+// Icon style packs); the XPhoneIconPacks columns in LauncherIcons.h share
+// the builtin order Today, Notifications, Priorities, Block, Read, Workout.
 
 // 1bpp blitter for the ported artwork (format per LauncherIcons.h header;
 // a cleared bit is ink, only ink pixels are drawn so paper stays white).
@@ -67,6 +69,136 @@ BatteryMonitor& battery() {
 }
 
 }  // namespace
+
+void LauncherScene::onEnter() {
+  loadSlots();
+  markDirty();
+}
+
+void LauncherScene::loadSlots() {
+  // Builtin id -> launcher icon index + label (LauncherIcons.h app order).
+  struct Builtin { const char* id; const char* label; int8_t icon; };
+  static constexpr Builtin kBuiltins[] = {
+      {"today", "Today", 0},        {"notifications", "Notifications", 1},
+      {"priorities", "Priorities", 2}, {"block", "Block", 3},
+      {"read", "Read", 4},          {"workout", "Workout", 5}};
+  char csv[224];
+  homeSlotsCsv(csv, sizeof(csv));
+  // A saved layout that names an app the card no longer holds is stale, and
+  // in 0.7 it can only be developer residue: no phone can write a layout
+  // yet. Patching the gap put Notifications wherever the dead entry happened
+  // to sit — first on Andrew's X3, when it belongs right after Today. So a
+  // stale list is dropped whole and the documented default order stands.
+  // Once a phone can arrange the home screen this wants revisiting, because
+  // then a saved list is a person's choice and only the dead entry should go.
+  {
+    char probe[224];
+    snprintf(probe, sizeof(probe), "%s", csv);
+    char* psave = nullptr;
+    bool stale = false;
+    for (char* tok = strtok_r(probe, ",", &psave); tok && !stale; tok = strtok_r(nullptr, ",", &psave)) {
+      bool isBuiltin = false;
+      for (const Builtin& b : kBuiltins) isBuiltin = isBuiltin || !strcmp(tok, b.id);
+      if (isBuiltin) continue;
+      char path[64];
+      snprintf(path, sizeof(path), "/apps/%s/app.json", tok);
+      if (!((SdMan.ready() || SdMan.begin()) && SdMan.exists(path))) stale = true;
+    }
+    if (stale) {
+      Serial.printf("[xphone-os] launcher: saved slots name a missing app; using the default order\n");
+      snprintf(csv, sizeof(csv), "%s", kDefaultSlotsCsv());
+      setHomeSlots(csv);
+    }
+  }
+  int n = 0;
+  char* save = nullptr;
+  for (char* tok = strtok_r(csv, ",", &save); tok && n < APP_COUNT; tok = strtok_r(nullptr, ",", &save)) {
+    Slot& s = _slots[n];
+    bool builtin = false;
+    for (const Builtin& b : kBuiltins) {
+      if (!strcmp(tok, b.id)) {
+        snprintf(s.id, sizeof(s.id), "%s", b.id);
+        snprintf(s.label, sizeof(s.label), "%s", b.label);
+        s.icon = b.icon;
+        builtin = true;
+        break;
+      }
+    }
+    if (!builtin) {
+      // An app that is no longer installed must not keep its tile. Removing
+      // an app deletes its files but never touched the saved slot list, so
+      // the home screen went on offering a tile that opens nothing — Andrew
+      // still saw Transit after it was removed (2026-09-08). When the app
+      // file is gone the NEXT unplaced builtin takes that position, in the
+      // order they are declared. Skipping the slot instead pushed the
+      // displaced builtin to the end of the grid, which put Notifications
+      // last on Andrew's X3 when it belongs right after Today.
+      {
+        char probe[64];
+        snprintf(probe, sizeof(probe), "/apps/%s/app.json", tok);
+        if (!((SdMan.ready() || SdMan.begin()) && SdMan.exists(probe))) {
+          const Builtin* fill = nullptr;
+          for (const Builtin& b : kBuiltins) {
+            bool used = false;
+            for (int i = 0; i < n && !used; ++i) used = !strcmp(_slots[i].id, b.id);
+            if (used) continue;
+            // Not already placed here, and not named later in the saved list
+            // either — otherwise this would steal a slot the person chose.
+            if (strstr(save ? save : "", b.id)) continue;
+            fill = &b;
+            break;
+          }
+          if (!fill) continue;
+          snprintf(s.id, sizeof(s.id), "%s", fill->id);
+          snprintf(s.label, sizeof(s.label), "%s", fill->label);
+          s.icon = fill->icon;
+          ++n;
+          continue;
+        }
+      }
+      // An installed app: label from its app.json "name" (filtered parse,
+      // first 256 bytes), else the dir name with a capital.
+      snprintf(s.id, sizeof(s.id), "%s", tok);
+      snprintf(s.label, sizeof(s.label), "%s", tok);
+      if (s.label[0] >= 'a' && s.label[0] <= 'z') s.label[0] = static_cast<char>(s.label[0] - 32);
+      s.icon = -1;
+      char path[64];
+      snprintf(path, sizeof(path), "/apps/%s/app.json", tok);
+      if (SdMan.ready() || SdMan.begin()) {
+        FsFile f = SdMan.open(path, O_RDONLY);
+        if (f) {
+          char buf[256];
+          const int got = f.read(buf, sizeof(buf) - 1);
+          f.close();
+          if (got > 0) {
+            buf[got] = 0;
+            JsonDocument filter;
+            filter["name"] = true;
+            JsonDocument doc;
+            if (!deserializeJson(doc, buf, static_cast<size_t>(got),
+                                 DeserializationOption::Filter(filter)) &&
+                doc["name"].as<const char*>())
+              snprintf(s.label, sizeof(s.label), "%s", doc["name"].as<const char*>());
+          }
+        }
+      }
+    }
+    ++n;
+  }
+  // Fill any short list with the builtins that are not yet placed.
+  for (const Builtin& b : kBuiltins) {
+    if (n >= APP_COUNT) break;
+    bool placed = false;
+    for (int i = 0; i < n; ++i) placed = placed || !strcmp(_slots[i].id, b.id);
+    if (placed) continue;
+    snprintf(_slots[n].id, sizeof(_slots[n].id), "%s", b.id);
+    snprintf(_slots[n].label, sizeof(_slots[n].label), "%s", b.label);
+    _slots[n].icon = b.icon;
+    ++n;
+  }
+  _slotsLoaded = true;
+  if (_sel >= APP_COUNT) _sel = 0;
+}
 
 void LauncherScene::moveSelection(const int dCol, const int dRow) {
   int sel = _sel;
@@ -124,19 +256,22 @@ void LauncherScene::handleInput(Input& in) {
   if (in.wasPressed(Btn::Up)) moveSelection(0, -1);
   if (in.wasPressed(Btn::Down)) moveSelection(0, +1);
   if (in.wasPressed(Btn::Confirm)) {
-    const char* app = kApps[_sel];
-    if (strcmp(app, "Block") == 0) {
+    if (!_slotsLoaded) loadSlots();
+    const char* id = _slots[_sel].id;
+    if (strcmp(id, "block") == 0) {
       showBlock();
-    } else if (strcmp(app, "Priorities") == 0) {
+    } else if (strcmp(id, "priorities") == 0) {
       showPriorities();
-    } else if (strcmp(app, "Today") == 0) {
+    } else if (strcmp(id, "today") == 0) {
       showToday();
-    } else if (strcmp(app, "Notifications") == 0) {
+    } else if (strcmp(id, "notifications") == 0) {
       showNotifications();
-    } else if (strcmp(app, "Read") == 0) {
+    } else if (strcmp(id, "read") == 0) {
       showReader();
-    } else if (strcmp(app, "Workout") == 0) {
+    } else if (strcmp(id, "workout") == 0) {
       showWorkout();
+    } else {
+      if (!showApp(id)) markDirty();  // a missing app just repaints the grid
     }
   }
   // BACK soft-key (short tap) opens Settings. SceneManager intercepts the
@@ -234,6 +369,7 @@ void LauncherScene::render(Gfx& gfx) {
   const int iconSize = XPhoneLauncherIconSize;
   const int labelLineH = gfx.lineHeight(kFontBold);
 
+  if (!_slotsLoaded) loadSlots();
   for (int i = 0; i < APP_COUNT; i++) {
     const int col = i % COLS;
     const int row = i / COLS;
@@ -257,13 +393,26 @@ void LauncherScene::render(Gfx& gfx) {
     const int iconAreaH = boxSide - 2 * kTilePad - labelLineH;
     int iconY = boxY + kTilePad + (iconAreaH > iconSize ? (iconAreaH - iconSize) / 2 : 0);
     const int iconX = cx + (side - iconSize) / 2;
-    if (const uint8_t* bmp = IconStyle::iconForApp(i)) {
-      drawIcon(gfx, bmp, iconX, iconY, iconSize);
+    const Slot& slot = _slots[i];
+    if (slot.icon >= 0) {
+      if (const uint8_t* bmp = IconStyle::iconForApp(slot.icon)) {
+        drawIcon(gfx, bmp, iconX, iconY, iconSize);
+      }
+    } else {
+      // Installed app: a monogram tile (rounded box + first letter at 2x)
+      // until the app format grows an icon field.
+      const int d = 64;
+      const int mx = cx + (side - d) / 2;
+      const int my = iconY + (iconSize - d) / 2;
+      gfx.drawRoundedRect(mx, my, d, d, 14, 3, true);
+      char mono[2] = {slot.label[0] ? slot.label[0] : '?', 0};
+      if (mono[0] >= 'a' && mono[0] <= 'z') mono[0] = static_cast<char>(mono[0] - 32);
+      gfx.drawTextScaledCentered(kFontBold, mx + d / 2, my + 6, mono, 2);
     }
 
     // Label inside the box, near the bottom edge.
     const XpFont& f = (i == _sel) ? kFontBold : kFontRegular;
     const int labelY = boxY + boxSide - kTilePad - labelLineH;
-    gfx.drawTextCentered(f, cx + side / 2, labelY, kApps[i]);
+    gfx.drawTextCentered(f, cx + side / 2, labelY, slot.label);
   }
 }

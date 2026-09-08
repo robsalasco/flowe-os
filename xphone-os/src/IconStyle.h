@@ -26,4 +26,8 @@ const char* packName(uint8_t i);
 
 uint8_t packCount();
 
+// Re-list /icons/*.xpi on the card (after a sync). Keeps the active pack if
+// its file is still there, else falls back to the first built-in.
+void rescan();
+
 }  // namespace IconStyle

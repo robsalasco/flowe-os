@@ -1,8 +1,8 @@
 #include "Ssd1677Driver.h"
+#include <Arduino.h>
 
 #include <BoardConfig.h>
 
-#include <vector>
 
 #include "../lut/Ssd1677Luts.h"
 
@@ -93,6 +93,16 @@ static const Ssd1677Config& ssd1677StickyConfig() {
   return cfg;
 }
 
+
+#if defined(SSD1677_PROBE_DEBUG) && SSD1677_PROBE_DEBUG
+// Bench probe (2026-09-06, sleep-poster hunt): a cheap fingerprint of a frame.
+static uint32_t probeSum(const uint8_t* b, uint32_t n) {
+  uint32_t sum = 0;
+  if (!b) return 0;
+  for (uint32_t i = 0; i < n; i += 97) sum = sum * 31u + b[i];
+  return sum;
+}
+#endif
 Ssd1677Driver::Ssd1677Driver(const Ssd1677Config& cfg)
     : _cfg(cfg),
       _w(BoardConfig::ACTIVE.displayWidth),
@@ -234,7 +244,7 @@ void Ssd1677Driver::refresh(EpdBus& bus, RefreshMode mode, bool turnOff) {
     }
     if (mode == RefreshMode::Half) {
       bus.cmd(CMD_WRITE_TEMP);
-      bus.data(_cfg.halfRefreshTemp);
+      bus.data(halfTempByte());
     }
     bus.cmd(CMD_DISPLAY_UPDATE_CTRL2);
     bus.data(seqOverride);
@@ -269,7 +279,7 @@ void Ssd1677Driver::refresh(EpdBus& bus, RefreshMode mode, bool turnOff) {
     displayMode |= 0x34;
   } else if (mode == RefreshMode::Half) {
     bus.cmd(CMD_WRITE_TEMP);
-    bus.data(_cfg.halfRefreshTemp);
+    bus.data(halfTempByte());
     displayMode |= 0xD4;
   } else {  // Fast
     displayMode |= _customLutActive ? 0x0C : 0x1C;
@@ -293,7 +303,12 @@ void Ssd1677Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev,
   // fast pages that follow.
   if (!turnOff) {
     if (_needsInitialFull) {
-      mode = RefreshMode::Full;
+      // The first clear after init. Boards with a warmed HALF sequence (X4:
+      // 0xD7 at the written 90 C, 1.7 s) take that: it is the vendor's own
+      // everyday full clean. The true-temperature FULL (0xF7) runs 3.8 s at
+      // room temperature and 8.8 s at 0 C (band sweep, 2026-09-06 01:30),
+      // and a wake should not wait for it. FULL stays available on request.
+      mode = (_cfg.halfSeqOverride != 0 && !_firstRefreshFull) ? RefreshMode::Half : RefreshMode::Full;
       _needsInitialFull = false;
     } else if (!_isScreenOn && _cfg.fullSeqOverride == 0) {
       // X4-class cold start: panel asleep -> a (warmed) HALF full-clear. Override
@@ -309,11 +324,29 @@ void Ssd1677Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev,
     grayscaleRevert(bus, fb);
   }
 
+  // A FULL/HALF (display mode 1) update issued while the panel is still powered
+  // from a FAST (display mode 2) update does not take the new image: the
+  // waveform runs for its full length and the glass keeps the previous frame.
+  // X4 bench, 2026-09-06: every FULL that followed a FAST failed this way
+  // (sleep poster, 'cal black'); every FULL that started from a powered-down
+  // panel landed; the 'paneloff on' A/B flipped the same poster from failing
+  // to landing. The vendor FAST sequence 0xFC leaves the panel powered on
+  // purpose (quick page turns), so cycle the power here, once, only in front
+  // of a mode-1 update. ~140 ms on a refresh that already takes seconds.
+  if (mode != RefreshMode::Fast) powerDown(bus, " pre-full power-down");
+
   setRamArea(bus, 0, 0, _w, _h);
+#if defined(SSD1677_PROBE_DEBUG) && SSD1677_PROBE_DEBUG
+  Serial.printf("[SSD1677] display mode=%d fb=%p sum=%08lx on=%d off=%d cpu=%lu\n", (int)mode, (const void*)fb,
+                (unsigned long)probeSum(fb, _bufferSize), (int)_isScreenOn, (int)turnOff,
+                (unsigned long)getCpuFrequencyMhz());
+#endif
 
   if (mode != RefreshMode::Fast) {
+    // FULL/HALF run with CTRL1_BYPASS_RED (refresh() below), so the RED plane
+    // is ignored during the update and resynced afterwards anyway. Writing it
+    // here was 48 KB / ~77 ms of dead SPI per scrub (P3, 2026-09-03).
     writeRam(bus, CMD_WRITE_RAM_BW, fb, _bufferSize);
-    writeRam(bus, CMD_WRITE_RAM_RED, fb, _bufferSize);
   } else {
     writeRam(bus, CMD_WRITE_RAM_BW, fb, _bufferSize);
     // Dual-buffer: RED holds the previous frame for the differential compare.
@@ -329,10 +362,32 @@ void Ssd1677Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev,
   // single-buffer mode so the next differential update starts from a matched
   // BW/RED baseline instead of assuming BW survived the refresh unchanged.
   if (prev == nullptr) {
+    // Resync RED (the "previous frame" for the next differential) only.
+    // Master activation does not touch BW RAM, so the BW rewrite that stock
+    // X4 also did was 48 KB / ~40 ms of SPI per refresh for nothing
+    // (P3 step 2, 2026-09-03; watch for ghost drift on the bench).
     setRamArea(bus, 0, 0, _w, _h);
-    writeRam(bus, CMD_WRITE_RAM_BW, fb, _bufferSize);
     writeRam(bus, CMD_WRITE_RAM_RED, fb, _bufferSize);
   }
+  if (mode == RefreshMode::Fast && !turnOff) powerDownAfterFast(bus);
+}
+
+// P2: the vendor FAST sequence (0xFC) carries no ANALOG_OFF/CLOCK_OFF bits, so
+// after a page turn the booster keeps running until the next FULL/HALF. When
+// idle power-off is on, drop it here. RAM is kept; the FAST sequence's
+// CLOCK_ON|ANALOG_ON bits bring the block back on the next refresh.
+void Ssd1677Driver::powerDown(EpdBus& bus, const char* tag) {
+  if (!_isScreenOn) return;
+  bus.cmd(CMD_DISPLAY_UPDATE_CTRL2);
+  bus.data(0x03);  // ANALOG_OFF_PHASE | CLOCK_OFF
+  bus.cmd(CMD_MASTER_ACTIVATION);
+  bus.waitBusy(tag);
+  _isScreenOn = false;
+}
+
+void Ssd1677Driver::powerDownAfterFast(EpdBus& bus) {
+  if (!_idlePowerOff) return;
+  powerDown(bus, " idle power-down");
 }
 
 void Ssd1677Driver::displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, uint16_t x, uint16_t y,
@@ -340,6 +395,10 @@ void Ssd1677Driver::displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t*
   if (x + w > _w || y + h > _h) return;
   if (x % 8 != 0 || w % 8 != 0) return;  // window must be byte-aligned
   if (!fb) return;
+#if defined(SSD1677_PROBE_DEBUG) && SSD1677_PROBE_DEBUG
+  Serial.printf("[SSD1677] window %u,%u %ux%u fb=%p sum=%08lx on=%d\n", x, y, w, h, (const void*)fb,
+                (unsigned long)probeSum(fb, _bufferSize), (int)_isScreenOn);
+#endif
 
   // A windowed update can't coexist with grayscale content on the rest of the
   // screen — drive it back to clean BW first (upstream parity; not a bare flag
@@ -348,37 +407,36 @@ void Ssd1677Driver::displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t*
     grayscaleRevert(bus, fb);
   }
 
-  const uint16_t windowWidthBytes = w / 8;
-  const uint32_t windowBufferSize = static_cast<uint32_t>(windowWidthBytes) * h;
-
-  std::vector<uint8_t> windowBuffer(windowBufferSize);
-  for (uint16_t row = 0; row < h; row++) {
-    const uint16_t srcY = y + row;
-    const uint32_t srcOffset = static_cast<uint32_t>(srcY) * _wb + (x / 8);
-    const uint32_t dstOffset = static_cast<uint32_t>(row) * windowWidthBytes;
-    memcpy(&windowBuffer[dstOffset], &fb[srcOffset], windowWidthBytes);
-  }
-
+  // Stream the window straight out of the framebuffer, one row per data
+  // burst. The controller's RAM pointer auto-increments inside the area set
+  // by setRamArea, so no staging copy is needed. This used to build two
+  // std::vector copies of the window (up to ~10 KB each) on the flush task;
+  // with exceptions compiled out, a failed allocation aborted the device.
+  // A display flush must never be able to crash the reader (X4, 2026-09-02).
   setRamArea(bus, x, y, w, h);
-  writeRam(bus, CMD_WRITE_RAM_BW, windowBuffer.data(), windowBufferSize);
+  writeRamWindow(bus, CMD_WRITE_RAM_BW, fb, x, y, w, h);
 
   if (prev != nullptr) {
-    std::vector<uint8_t> previousWindow(windowBufferSize);
-    for (uint16_t row = 0; row < h; row++) {
-      const uint16_t srcY = y + row;
-      const uint32_t srcOffset = static_cast<uint32_t>(srcY) * _wb + (x / 8);
-      const uint32_t dstOffset = static_cast<uint32_t>(row) * windowWidthBytes;
-      memcpy(&previousWindow[dstOffset], &prev[srcOffset], windowWidthBytes);
-    }
-    writeRam(bus, CMD_WRITE_RAM_RED, previousWindow.data(), windowBufferSize);
+    writeRamWindow(bus, CMD_WRITE_RAM_RED, prev, x, y, w, h);
   }
 
   refresh(bus, RefreshMode::Fast, turnOff);
 
   if (prev == nullptr) {
     setRamArea(bus, x, y, w, h);
-    writeRam(bus, CMD_WRITE_RAM_BW, windowBuffer.data(), windowBufferSize);
-    writeRam(bus, CMD_WRITE_RAM_RED, windowBuffer.data(), windowBufferSize);
+    writeRamWindow(bus, CMD_WRITE_RAM_BW, fb, x, y, w, h);
+    writeRamWindow(bus, CMD_WRITE_RAM_RED, fb, x, y, w, h);
+  }
+  if (!turnOff) powerDownAfterFast(bus);
+}
+
+void Ssd1677Driver::writeRamWindow(EpdBus& bus, uint8_t ramCmd, const uint8_t* src, uint16_t x, uint16_t y,
+                                   uint16_t w, uint16_t h) {
+  const uint16_t rowBytes = w / 8;
+  bus.cmd(ramCmd);
+  for (uint16_t row = 0; row < h; row++) {
+    const uint32_t srcOffset = static_cast<uint32_t>(y + row) * _wb + (x / 8);
+    bus.data(src + srcOffset, rowBytes);
   }
 }
 

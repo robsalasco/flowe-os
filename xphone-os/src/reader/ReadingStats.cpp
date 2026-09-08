@@ -278,6 +278,12 @@ bool ReadingStats::bookStats(const std::string& bookPath, uint32_t* pages, uint3
   return found;
 }
 
+uint16_t ReadingStats::sessionMinutes() {
+  if (!s_active) return 0;
+  const uint32_t mins = (millis() - s_startMs) / 60000UL;
+  return mins > 0xFFFF ? 0xFFFF : static_cast<uint16_t>(mins);
+}
+
 uint16_t ReadingStats::todayMinutes() {
   load();
   const uint32_t today = todayYmd();

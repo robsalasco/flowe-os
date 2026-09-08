@@ -432,6 +432,16 @@ void Gfx::drawTextCentered(const XpFont& f, const int cx, const int y, const cha
 // '?' in drawText, same as every other text path.
 int Gfx::drawTextWrapped(const XpFont& f, const int x, int y, const char* text, const int maxWidth,
                          const int maxLines, const bool black) {
+  return wrapText(f, x, y, text, maxWidth, maxLines, black, /*draw=*/true);
+}
+
+int Gfx::countWrappedLines(const XpFont& f, const char* text, const int maxWidth, const int maxLines) {
+  return wrapText(f, 0, 0, text, maxWidth, maxLines, true, /*draw=*/false);
+}
+
+// The one wrap walker: drawTextWrapped paints, countWrappedLines only counts.
+int Gfx::wrapText(const XpFont& f, const int x, int y, const char* text, const int maxWidth,
+                  const int maxLines, const bool black, const bool draw) {
   if (!text || !text[0] || maxWidth <= 0 || maxLines <= 0) return 0;
 
   int lines = 0;
@@ -502,7 +512,7 @@ int Gfx::drawTextWrapped(const XpFont& f, const int x, int y, const char* text, 
       snprintf(line, sizeof(line), "%s", probe);
     }
 
-    drawText(f, x, y, line, black);
+    if (draw) drawText(f, x, y, line, black);
     y += f.lineAdvance;
     lines++;
     pos = resume;

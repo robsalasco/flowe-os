@@ -74,10 +74,24 @@ class Ssd1677Driver : public PanelDriver {
   void grayscaleRevert(EpdBus& bus, const uint8_t* fb) override;
   void setCustomLut(EpdBus& bus, bool enabled, const unsigned char* data) override;
 
+  void setIdlePowerOff(bool on) override { _idlePowerOff = on; }
+  void setHalfTemp(int8_t c) override { _halfTemp = c; }
+  void setFirstRefreshFull(bool on) override { _firstRefreshFull = on; }
+  int8_t halfTemp() const override { return _halfTemp; }
+  bool idlePowerOff() const override { return _idlePowerOff; }
+
  private:
+  bool _idlePowerOff = false;
+  int8_t _halfTemp = 0x7F;  // 0x7F: use _cfg.halfRefreshTemp
+  uint8_t halfTempByte() const { return _halfTemp == 0x7F ? _cfg.halfRefreshTemp : (uint8_t)_halfTemp; }
+  void powerDownAfterFast(EpdBus& bus);
+  // Analog + clock off (0x22=0x03). No-op when the panel is already off.
+  void powerDown(EpdBus& bus, const char* tag);
   void initController(EpdBus& bus);
   void setRamArea(EpdBus& bus, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
   void writeRam(EpdBus& bus, uint8_t ramCmd, const uint8_t* data, uint32_t size);
+  void writeRamWindow(EpdBus& bus, uint8_t ramCmd, const uint8_t* src, uint16_t x, uint16_t y, uint16_t w,
+                      uint16_t h);
   void refresh(EpdBus& bus, RefreshMode mode, bool turnOff);
 
   const Ssd1677Config& _cfg;
@@ -100,6 +114,7 @@ class Ssd1677Driver : public PanelDriver {
   // a clean differential baseline. Only armed for boards whose self-powering fast
   // sequence makes _isScreenOn useless as a cold-start signal (fullSeqOverride set).
   bool _needsInitialFull = false;
+  bool _firstRefreshFull = false;  // bench A/B: keep the true-temperature FULL as the first clear
 };
 
 // Singleton accessor (Meyers, zero-heap). Selects the config for the active board.

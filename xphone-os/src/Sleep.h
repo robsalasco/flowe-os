@@ -11,6 +11,7 @@
 // runs again and the first paint is a FULL refresh that cleanly replaces the
 // sleep screen (main.cpp boot()).
 
+#include <cstddef>
 #include <cstdint>
 
 class Gfx;
@@ -32,12 +33,71 @@ class Input;
 #ifndef XP_AUTO_SLEEP_BLOCK_MS
 #define XP_AUTO_SLEEP_BLOCK_MS 120000UL
 #endif
+// Two-stage idle policy (Andrew, 2026-09-05): idle -> NAP (sleep screen on,
+// chip napping, Bluetooth kept, any press wakes at once) -> OFF (deep sleep).
+#ifndef XP_AUTO_NAP_MS
+#define XP_AUTO_NAP_MS 300000UL         // 5 min idle -> nap
+#endif
+#ifndef XP_AUTO_NAP_BLOCK_MS
+#define XP_AUTO_NAP_BLOCK_MS 120000UL   // 2 min while a block runs
+#endif
+#ifndef XP_AUTO_OFF_MS
+#define XP_AUTO_OFF_MS 3600000UL        // 60 min idle -> off (never while charging)
+#endif
 
 namespace Sleep {
+// Sleep policy in Settings (Andrew, 2026-09-06): idle minutes before the nap
+// and before OFF. 0 = never. Stored in NVS ("sleep": napMin, offMin); the
+// defaults are the 5 / 60 of the 5 September policy. A running block keeps
+// its shorter nap window when that is shorter than the setting.
+uint16_t napAfterMin();
+uint16_t offAfterMin();
+void setNapAfterMin(uint16_t min);
+void setOffAfterMin(uint16_t min);
+uint16_t cycleNapAfter(int delta);  // through the Settings choices; returns the new value
+uint16_t cycleOffAfter(int delta);
+void formatMinutes(char* out, size_t n, uint16_t min);  // "Never", "5 min", "1 h", "2 h 30"
+// The Settings choices, for the picker screen (2026-09-06): a list with the
+// current value marked, like every other list on the device.
+int napChoiceCount();
+uint16_t napChoiceAt(int i);
+int offChoiceCount();
+uint16_t offChoiceAt(int i);
+
+// Settings > Sleep > Sleep screen (Andrew, 2026-09-06: a custom sleep screen,
+// the person chooses). 0 = Priorities (the proven poster; Workout when napped
+// from Workout), 1 = Last screen (the home hero the device slept from, from
+// the home-apps lane; needs the Widget home). NVS "sleep": face.
+enum class Face : uint8_t { Priorities = 0, LastScreen = 1 };
+Face face();
+void setFace(Face f);
+Face cycleFace(int delta);
+const char* faceName(Face f);
+
+// Bench A/B for the OFF poster tier: 0 = policy (FULL), 1 = HALF, 2 = FULL.
+extern uint8_t gPosterTierOverride;
+// P1.2 (efficiency test plan 2026-09-02): the X3's QMI8658 motion sensor is
+// never used, but its oscillator runs from power-on until deep sleep. Put it
+// to sleep once at boot. No-op when the sensor is not found.
+void imuSleepAtBoot();
 
 // Never returns: ends in esp_deep_sleep_start(). Call from the main loop only
 // (draws with gfx, waits on input for the power-button release).
 [[noreturn]] void sleepNow(Gfx& gfx, Input& input);
+
+/// The sleep screen, composed at full CPU speed and flushed FULL. Used by
+/// the nap (screen off, link kept) and by sleepNow on the way to deep sleep.
+/// `napping`: the device is only resting (Bluetooth on, a press brings the
+/// screen back at once) — the poster gets a frame and says so. Otherwise it
+/// is the OFF poster: no frame, "Off".
+void drawSleepScreenNow(Gfx& gfx, bool napping);
+
+// Live nap poster (Andrew, 2026-09-06): while the device naps, a fresh
+// priorities, workout, or Today snapshot from the phone redraws the poster
+// with one FAST differential refresh (X4 0.6 s, no flash). Composes the nap
+// poster again and flushes it only when the frame changed. Returns true
+// when the glass was refreshed.
+bool refreshNapPoster(Gfx& gfx);
 
 // M4.2 last-scene restore. sleepNow() persists the on-glass scene id
 // (AppScenes.h gCurrentSceneId) in NVS flash (Arduino Preferences), which
@@ -47,6 +107,9 @@ namespace Sleep {
 // no prior sleep goes to the launcher); false when no key is stored. Kept as a
 // plain uint32_t so Sleep does not depend on the SceneId enum.
 bool consumeRestoreScene(uint32_t& sceneId);
+// Arm the same key by hand for a deliberate restart (the reader's memory
+// recovery, 2026-09-06): the next boot lands on `sceneId`.
+void armRestoreScene(uint32_t sceneId);
 
 // M4.3 wake-from-active-block. sleepNow() persists a tiny Block snapshot
 // (active/onBreak/preset/endsAtLabel/duration/remaining) to the same NVS
