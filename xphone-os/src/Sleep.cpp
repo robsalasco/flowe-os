@@ -148,26 +148,16 @@ void composeSleepScreen(Gfx& gfx, const bool napping) {
 
     PrioritiesScene::renderDormantWakeHint(gfx, napping);
   }
-  // Ghost scrub: auto-sleep fires after minutes of an unchanged, differential-
-  // refreshed image, and one FULL inversion pass can leave a faint imprint of
-  // it behind the dormant frame. Boot conditioning runs TWO full syncs for the
-  // same reason (Uc8253X3Driver::begin, _initialFullSyncsRemaining = 2), so
-  // mirror it here: requestResync(1) makes this FULL run as a forced full sync
-  // plus one post-condition pass with the OEM _normal bank. No-op on X4.
-  // Two kinds of sleep (Andrew, 2026-09-05, "lights out"): a nap keeps the
-  // light poster with its live content and a "still connected" dot; OFF is
-  // the same poster inverted, white on black, so the two rest states are
-  // told apart from across the room and in the dark. The content stays on
-  // both: it is useful.
-  if (!napping) gfx.invert();
+  // Nap and sleep share the light poster. The larger moon and bold "asleep"
+  // footer mark deep sleep without changing the background or useful content.
 }
 
 void drawSleepScreen(Gfx& gfx, const bool napping) {
   composeSleepScreen(gfx, napping);
   gLastPosterFingerprint = napping ? frameFingerprint(gfx) : 0;
   // Through the flush task (no light-sleep slice mid-waveform). OFF is the
-  // deep, clean state and takes the FULL: the inverted poster wants the
-  // strongest black. A nap is quick and reversible: on the X4 it takes the
+  // deep, clean state and takes the FULL before the panel powers down.
+  // A nap is quick and reversible: on the X4 it takes the
   // warmed HALF clean (1.9 s, the vendor's everyday full clean; the true FULL
   // there runs 3.9 s). The X3's FULL is already 1.9 s and Andrew checked that
   // poster by hand (2026-09-05), so the X3 keeps it.

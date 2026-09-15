@@ -85,11 +85,11 @@ void imuSleepAtBoot();
 // (draws with gfx, waits on input for the power-button release).
 [[noreturn]] void sleepNow(Gfx& gfx, Input& input);
 
-/// The sleep screen, composed at full CPU speed and flushed FULL. Used by
+/// The sleep screen, composed at full CPU speed. Used by
 /// the nap (screen off, link kept) and by sleepNow on the way to deep sleep.
 /// `napping`: the device is only resting (Bluetooth on, a press brings the
-/// screen back at once) — the poster gets a frame and says so. Otherwise it
-/// is the OFF poster: no frame, "Off".
+/// screen back at once). Both states use a light background. Deep sleep has
+/// a larger moon and bold "asleep" footer. Refresh tiers stay state-specific.
 void drawSleepScreenNow(Gfx& gfx, bool napping);
 
 // Live nap poster (Andrew, 2026-09-06): while the device naps, a fresh
