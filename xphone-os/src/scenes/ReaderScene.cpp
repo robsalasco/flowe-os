@@ -654,7 +654,9 @@ void ReaderScene::workOpenBook() {
 #endif
   // Leaving the grid: hand the ~58KB cover-decoder scratch back to the heap
   // before anything else claims it.
+  xpTrace("reader: open begin");
   reader::CoverThumb::releaseScratch();
+  xpTrace("reader: cover scratch released");
   _coverageChecked = false;
   _coverageNotice = false;
   _endOffer = false;  // a stale offer must not survive into the next book
@@ -2175,6 +2177,7 @@ void ReaderScene::renderFbp(Gfx& gfx) {
     }
     // contentRight, not width(): in landscape the soft-key column eats the
     // right edge and the compiled landscape profiles are that much narrower.
+    xpTrace("reader: fbp profile select");
     if (!_fbp->selectProfile((uint16_t)contentRight(gfx, 0), (uint16_t)gfx.height(), preferPx)) {
       if (!_fbp->lastFailNoMemory()) {
         renderMessage(gfx, "Read", "Package profile mismatch");
@@ -2196,6 +2199,8 @@ void ReaderScene::renderFbp(Gfx& gfx) {
           prefs.end();
         }
       }
+      xpTrace(restartedAlready ? "reader: fbp NO ROOM (second try)"
+                               : "reader: fbp NO ROOM (restarting quietly)");
       Serial.printf("[xphone-os] reader: no room for a page buffer (free=%u largest=%u)%s\n",
                     ESP.getFreeHeap(),
                     static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
@@ -2215,6 +2220,7 @@ void ReaderScene::renderFbp(Gfx& gfx) {
         prefs.end();
       }
     }
+    xpTrace("reader: fbp profile ok");
   }
   if (_fbpPosPending) {
     _fbpPage = reader::FbpBook::loadPos(_bookPath.c_str(), _fbp->pageCount());

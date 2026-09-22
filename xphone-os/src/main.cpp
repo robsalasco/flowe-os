@@ -193,8 +193,15 @@ static void bootTrace(const char* stage) {
   if (!gBootTrace) return;
   FsFile f = SdMan.open("/boot-trace.txt", O_WRONLY | O_APPEND);
   if (!f) return;
-  char line[96];
-  const int n = snprintf(line, sizeof(line), "%8lu ms  %s\n", millis(), stage);
+  // Each breadcrumb also carries the live heap numbers: "the step that died"
+  // says nothing about WHERE the memory went, and a field unit with no serial
+  // cable can still hand us a stage-by-stage heap curve this way.
+  char line[160];
+  const int n = snprintf(line, sizeof(line), "%8lu ms  free=%6lu min=%6lu largest=%6lu  %s\n", millis(),
+                         static_cast<unsigned long>(ESP.getFreeHeap()),
+                         static_cast<unsigned long>(esp_get_minimum_free_heap_size()),
+                         static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+                         stage);
   if (n > 0) f.write(reinterpret_cast<const uint8_t*>(line), static_cast<size_t>(n));
   f.flush();
   f.close();
@@ -464,6 +471,7 @@ static void boot() {
   if (gCurrentSceneId == SceneId::Reader) {
     Serial.println("[xphone-os] radios deferred: Reader scene restored (resume on reader exit)");
   } else {
+    bootTrace("radio: BLE begin");
     COMPANION_BLE.begin();
     {
       Preferences p;  // a sync ended with a restart: tell the phone it stopped
@@ -479,6 +487,7 @@ static void boot() {
     COMPANION_ANCS.begin();
     COMPANION_ANCS.requestPairing();
     Serial.printf("[xphone-os] BLE companion + ANCS armed (%lu ms after boot)\n", millis() - tBoot);
+    bootTrace("radio: BLE + ANCS armed");
   }
 
   // Stage 6 (M2.1b): drop the CPU to XP_CPU_MHZ. Placed AFTER BLE begin() so
