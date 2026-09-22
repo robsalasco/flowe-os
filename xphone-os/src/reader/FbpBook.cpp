@@ -996,12 +996,14 @@ static bool writeXtBin(const char* path, uint16_t w, uint16_t h, FsFile& src, ui
   return ok;
 }
 
-bool FbpBook::ensureShelfSidecars(const char* path, bool* has_cover, bool* has_strip) {
+bool FbpBook::ensureShelfSidecars(const char* path, bool* has_cover, bool* has_strip,
+                                  bool* pkg_declares_cover) {
   char cov[192], str[192];
   snprintf(cov, sizeof(cov), "%s.cov", path);
   snprintf(str, sizeof(str), "%s.str", path);
   *has_cover = SdMan.exists(cov);
   *has_strip = SdMan.exists(str);
+  if (pkg_declares_cover) *pkg_declares_cover = false;
   // BOTH, not either: a book that ever got one sidecar but not the other
   // (interrupted transfer, full card) used to be stuck that way forever.
   if (*has_cover && *has_strip) return true;  // extracted on a previous scan
@@ -1018,6 +1020,9 @@ bool FbpBook::ensureShelfSidecars(const char* path, bool* has_cover, bool* has_s
   memcpy(&sw, shdr + 8, 2);
   memcpy(&sh, shdr + 10, 2);
   memcpy(&ss, shdr + 12, 4);
+  // Cover only: a missing strip is a cosmetic fallback (the tile then draws
+  // the title as text), while a missing cover is what leaves the tile blank.
+  if (pkg_declares_cover) *pkg_declares_cover = (ts > 0);
   uint64_t bits = b._hdr.shelf_off + 16;
   if (ts && !*has_cover) {
     b._f.seekSet(bits);
