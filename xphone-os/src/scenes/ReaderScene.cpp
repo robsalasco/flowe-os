@@ -2948,11 +2948,22 @@ bool ReaderScene::loadShelfIndex() {
       snprintf(e.title, sizeof(e.title), "%s", row.title);
       snprintf(e.author, sizeof(e.author), "%s", row.author);
       e.focusEdition = row.focus != 0;
-      e.meta = row.hasCover ? TileMeta::Cover : TileMeta::NoCover;
       if (row.hasCover) {
+        e.meta = TileMeta::Cover;
         e.thumbW = row.thumbW;
         e.thumbH = row.thumbH;
       }
+      // A row with hasCover == 0 must NOT pin the tile to NoCover. That row
+      // may have been written while the package was still incomplete (first
+      // sync) or when the sidecar write failed, and once NoCover is cached
+      // the grid's work path only calls ensureShelfSidecars() when the tile
+      // is Unknown — the comment there calls it "a damaged book never
+      // resolves". Leaving the tile Unknown lets the normal path retry the
+      // extraction once per session. The cost is negligible: a coverless
+      // package just re-opens the file and reads 16 header bytes (nothing is
+      // written when ts == 0); a package that does carry a cover extracts
+      // the sidecar and the row is corrected to hasCover == 1 on the next
+      // save. Title/author/focus are still taken from the row above.
       if (e.title[0] == 0) prettyFileTitle(e.path, e.title, sizeof(e.title));
       filled++;
       break;
@@ -3176,9 +3187,9 @@ void ReaderScene::scanBooks(const int windowOffset) {
         // A package with an empty title in its header would otherwise wipe
         // the seeded name and leave the tile blank.
         if (b.title[0] == '\0') prettyFileTitle(b.path, b.title, sizeof(b.title));
-        bool hasCover = false, hasStrip = false;
+        bool hasCover = false, hasStrip = false, pkgDeclaresCover = false;
         xpTrace("reader: extract cover art");
-        reader::FbpBook::ensureShelfSidecars(b.path, &hasCover, &hasStrip);
+        reader::FbpBook::ensureShelfSidecars(b.path, &hasCover, &hasStrip, &pkgDeclaresCover);
         if (hasCover) {
           // Only the DIMS are cached; renderTile derives the sidecar path
           // from b.path at draw time. Storing it needed path + ".cov" to
@@ -3188,6 +3199,14 @@ void ReaderScene::scanBooks(const int windowOffset) {
           char cov[sizeof(b.path) + 8];
           snprintf(cov, sizeof(cov), "%s.cov", b.path);
           if (readThumbDims(cov, &b.thumbW, &b.thumbH)) b.meta = TileMeta::Cover;
+        }
+        if (pkgDeclaresCover && !hasCover) {
+          // The package declares a shelf cover (ts > 0) but the sidecar is
+          // still not there after the extraction attempt — the silent half
+          // that a serial-only field device could never otherwise diagnose.
+          Serial.printf("[xphone-os] reader: '%s' declares a shelf cover but its sidecar could not be written\n",
+                        b.path);
+          xpTrace("reader: sidecar write failed");
         }
       }
       // Count the open only when it taught us something. A damaged book never
