@@ -25,6 +25,7 @@
 #include <EInkDisplay.h>
 
 #include <cstdint>
+#include <string>
 
 #include "fonts/EpdFontData.h"
 
@@ -85,9 +86,10 @@ class Gfx {
   Orient orientation() const { return _orient; }
 
   // True when every character of `text` has a glyph in `f`. The UI fonts
-  // are ASCII+Latin subsets, so an Arabic/CJK/Cyrillic string would draw
-  // as a row of "?" — callers with a bitmap alternative (the FBP shaped
-  // title strip) use this to choose.
+  // cover ASCII + Latin-1 + Latin Extended-A + Greek + Cyrillic but NOT
+  // General Punctuation (U+2000..U+206F), so an Arabic/CJK/Hebrew string
+  // (or an em dash / ellipsis) would draw as a row of "?" — callers with a
+  // bitmap alternative (the FBP shaped title strip) use this to choose.
   bool canRender(const XpFont& f, const char* text) const;
 
   // Integer-scaled text. The builtin fonts ship at three sizes only
@@ -182,6 +184,14 @@ class Gfx {
   const EpdGlyph* findGlyph(const XpFont& f, uint32_t cp) const;
   void blitGlyph(const XpFont& f, const EpdGlyph* g, int penX, int lineTopY, bool black);
   static uint32_t nextCodepoint(const char** s);
+  // Compose `src` to NFC. The device fonts have no combining-mark glyphs
+  // (U+0300..U+036F), so NFD text (base + combining mark) would otherwise draw
+  // its marks as '?'. Returns `src` untouched when no combining mark is present
+  // (fast path: a single lead-byte scan, no copy, no allocation — drawText is on
+  // the hot path); otherwise composes into the caller's `scratch` std::string
+  // (never truncated: composed text is never longer than the source) and returns
+  // scratch.c_str().
+  const char* composeForUi(const char* src, std::string& scratch) const;
 
   EInkDisplay& _d;
   uint8_t* _fb = nullptr;

@@ -1,5 +1,7 @@
 #include "Gfx.h"
 
+#include <Utf8.h>
+
 #include <cstdio>
 #include <cstring>
 
@@ -255,8 +257,33 @@ uint32_t Gfx::nextCodepoint(const char** s) {
   return cp;
 }
 
+// The UI text funnel composes NFD input to NFC once, here. Canonical
+// composition can only change text containing a combining mark U+0300..U+036F
+// (UTF-8 lead byte 0xCC/0xCD), so the common case (plain ASCII / already-NFC
+// Latin) returns `src` untouched after a single byte scan — no copy, no
+// allocation. drawText and textWidth are on the hot path (list rows, per-frame
+// layout measurement), so they must not pay an extra copy per call. The slow
+// path composes into the caller's scratch std::string and never truncates:
+// composed text is never longer than its source, so a long NFD string (e.g. a
+// dictionary definition) keeps all of its visible text.
+const char* Gfx::composeForUi(const char* src, std::string& scratch) const {
+  if (!src) return src;
+  bool maybeHasMarks = false;
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(src); *p; p++) {
+    if (*p == 0xCC || *p == 0xCD) {
+      maybeHasMarks = true;
+      break;
+    }
+  }
+  if (!maybeHasMarks) return src;
+  scratch = utf8ComposeNfc(src);
+  return scratch.c_str();
+}
+
 bool Gfx::canRender(const XpFont& f, const char* text) const {
   if (!text) return false;
+  std::string buf;
+  text = composeForUi(text, buf);
   uint32_t cp;
   while ((cp = nextCodepoint(&text)) != 0) {
     if (cp == ' ') continue;
@@ -355,6 +382,8 @@ void Gfx::blitGlyph(const XpFont& f, const EpdGlyph* g, const int penX, const in
 void Gfx::drawTextScaled(const XpFont& f, const int x, const int y, const char* text,
                          const int scale, const bool black) {
   if (!text || scale < 1) return;
+  std::string buf;
+  text = composeForUi(text, buf);
   if (scale == 1) {
     drawText(f, x, y, text, black);
     return;
@@ -394,6 +423,8 @@ void Gfx::drawTextScaled(const XpFont& f, const int x, const int y, const char* 
 
 void Gfx::drawTextScaledCentered(const XpFont& f, const int cx, const int y, const char* text,
                                  const int scale, const bool black) {
+  std::string buf;
+  text = composeForUi(text, buf);
   drawTextScaled(f, cx - textWidthScaled(f, text, scale) / 2, y, text, scale, black);
 }
 
@@ -410,11 +441,15 @@ int Gfx::capTopOffset(const XpFont& f) const {
 }
 
 int Gfx::textWidthScaled(const XpFont& f, const char* text, const int scale) const {
+  std::string buf;
+  text = composeForUi(text, buf);
   return textWidth(f, text) * (scale < 1 ? 1 : scale);
 }
 
 int Gfx::textWidth(const XpFont& f, const char* text) const {
   if (!text) return 0;
+  std::string buf;
+  text = composeForUi(text, buf);
   int32_t advFp = 0;  // 12.4 fixed-point accumulator
   uint32_t cp;
   while ((cp = nextCodepoint(&text)) != 0) {
@@ -427,6 +462,8 @@ int Gfx::textWidth(const XpFont& f, const char* text) const {
 
 void Gfx::drawText(const XpFont& f, const int x, const int y, const char* text, const bool black) {
   if (!text) return;
+  std::string buf;
+  text = composeForUi(text, buf);
   int32_t advFp = 0;  // 12.4 fixed-point pen position relative to x
   uint32_t cp;
   while ((cp = nextCodepoint(&text)) != 0) {
@@ -439,6 +476,8 @@ void Gfx::drawText(const XpFont& f, const int x, const int y, const char* text, 
 }
 
 void Gfx::drawTextCentered(const XpFont& f, const int cx, const int y, const char* text, const bool black) {
+  std::string buf;
+  text = composeForUi(text, buf);
   drawText(f, cx - textWidth(f, text) / 2, y, text, black);
 }
 
@@ -459,6 +498,9 @@ int Gfx::countWrappedLines(const XpFont& f, const char* text, const int maxWidth
 int Gfx::wrapText(const XpFont& f, const int x, int y, const char* text, const int maxWidth,
                   const int maxLines, const bool black, const bool draw) {
   if (!text || !text[0] || maxWidth <= 0 || maxLines <= 0) return 0;
+
+  std::string buf;
+  text = composeForUi(text, buf);
 
   int lines = 0;
   const char* pos = text;
